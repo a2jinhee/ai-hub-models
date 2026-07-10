@@ -749,6 +749,13 @@ class Pi05ActionExpert(LoadPolicyMixin, BaseModel):
             assert isinstance(pg_we, PaliGemmaWithExpertModel)
             pal_cfg = pg_we.paligemma.config.text_config
             for layer in pg_we.gemma_expert.model.layers:
+                # load_checkpoint() returns an lru_cached, shared PI05Policy, and
+                # this replacement mutates it in place. Building the action expert
+                # more than once against the same cached policy (e.g. the
+                # quantizable component + the fp Pi05Collection) would otherwise
+                # re-wrap an already-SHA module, whose q_proj no longer exists.
+                if isinstance(layer.self_attn, SHAGemmaExpertAttention):
+                    continue
                 layer.self_attn = SHAGemmaExpertAttention(
                     layer.self_attn,
                     pal_cfg.num_attention_heads,
@@ -777,12 +784,20 @@ class Pi05ActionExpert(LoadPolicyMixin, BaseModel):
         cfg = model.model.config
         num_steps = int(getattr(cfg, "num_inference_steps", 10))
 
+        # Build on the flow model's own device so the resulting cached buffer
+        # lands there too. Building on CPU (the default) and then moving the
+        # model to match (as this used to do) silently relocated the shared,
+        # lru_cached policy and left cached_adarms_cond stranded on CPU while
+        # the weights were later moved back to the GPU by another component.
+        dev = next(model.model.parameters()).device
+
         # t: 1.0, 1 - 1/N, ..., 0.0 (N+1 points)
         t_vals = torch.linspace(
             1.0,
             0.0,
             steps=num_steps + 1,
             dtype=torch.float32,
+            device=dev,
         )
 
         # Create sinusoidal time embedding as in PI05. The embedding dim
@@ -796,10 +811,11 @@ class Pi05ActionExpert(LoadPolicyMixin, BaseModel):
             1.0,
             steps=dim // 2,
             dtype=torch.float32,
+            device=dev,
         )
 
-        min_p = torch.as_tensor(cfg.min_period, dtype=torch.float32)
-        max_p = torch.as_tensor(cfg.max_period, dtype=torch.float32)
+        min_p = torch.as_tensor(cfg.min_period, dtype=torch.float32, device=dev)
+        max_p = torch.as_tensor(cfg.max_period, dtype=torch.float32, device=dev)
         period = min_p * (max_p / min_p) ** frac
         scale = (2.0 * torch.pi) / period
 
@@ -809,8 +825,8 @@ class Pi05ActionExpert(LoadPolicyMixin, BaseModel):
             dim=1,
         )
 
-        # Apply the model's time MLP layers (SiLU).
-        model.model.to(time_emb.device)
+        # Apply the model's time MLP layers (SiLU). time_emb already lives on
+        # the model's device, so no relocation of the shared model is needed.
         time_emb = model.model.time_mlp_in(time_emb)
         time_emb = torch.nn.functional.silu(time_emb)
         time_emb = model.model.time_mlp_out(time_emb)
@@ -840,6 +856,9 @@ class Pi05ActionExpert(LoadPolicyMixin, BaseModel):
         n_steps = s_len - 1
         idx = torch.round((1.0 - time_step) * float(n_steps)).to(torch.long)
         idx = torch.clamp(idx, 0, s_len - 1)
+        # Align the gather index to the cached buffer's device: time_step may
+        # arrive on a different device than the buffer.
+        idx = idx.to(self.cached_adarms_cond.device)
         return self.cached_adarms_cond.index_select(0, idx)
 
     def expert_forward(

@@ -70,7 +70,7 @@ def evaluate_model(
         if num_calibration_samples is not None:
             kwargs["num_calibration_samples"] = num_calibration_samples
 
-        export_model(**kwargs)
+        export_model(model_id, **kwargs)
         return
 
     # Verify App implements the protocol (runtime check only - mypy can't verify)
