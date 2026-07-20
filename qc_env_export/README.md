@@ -26,8 +26,8 @@ conda deactivate && conda activate qc        # re-activate so the hook runs
 
 # 3. Install ai-hub-models from your fork (two editable subdir packages)
 cd ~/ai-hub-models
-pip install -e src
 pip install -e cli
+pip install -e src
 
 # 4. Install aimet from your fork
 #    (original env used the prebuilt wheel aimet-onnx 2.26.0+cu121:
@@ -35,6 +35,17 @@ pip install -e cli
 #    Build/install per your aimet fork's instructions, e.g.:
 cd ~/aimet
 pip install -e .        # or follow the repo's build steps
+
+# 5. Only if you need lerobot's PI0 / PI05 policies:
+#    environment.yml pins plain `transformers==4.53.3` from PyPI, but
+#    PI0Pytorch/PI05Pytorch self-check for a patched siglip module that only
+#    exists in lerobot's transformers fork. Without it, loading pi05 (e.g.
+#    qai_hub_models/models/pi05/quantize.py) fails with:
+#      ValueError: An incorrect transformer version is used, please create
+#      an issue on https://github.com/huggingface/lerobot/issues
+#    Fix by overwriting the pinned transformers with the fork lerobot's own
+#    `pi` extra uses (see https://github.com/huggingface/lerobot/blob/v0.4.1/pyproject.toml):
+pip install "transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi"
 ```
 
 ## Verify
@@ -47,5 +58,6 @@ python -c "import qai_hub_models, aimet_onnx; print('ok')"
 ```
 
 ## Notes
+- `transformers==4.53.3` (pinned in `environment.yml`) is the plain PyPI release and does **not** work with lerobot's `pi0`/`pi05` policies — install the fork in step 5 if you need those.
 - The env pins CUDA-12 pip wheels (`nvidia-*-cu12`, `torch==2.7.1`, `onnxruntime-gpu==1.23.2`). The target server needs a compatible NVIDIA driver (CUDA 12.x capable).
 - If `conda env create` is slow/conflicts on the pip section, the conda-level pins in `environment.yml` are exact-build strings; loosen them (drop the `=build` suffix) if the target has different base packages.

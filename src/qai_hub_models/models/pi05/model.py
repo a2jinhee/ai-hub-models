@@ -42,6 +42,7 @@ from qai_hub_models.models.pi05.model_adaptation import (
     SHAGemmaExpertAttention,
     apply_rope_direct,
 )
+from qai_hub_models.models.pi05.spinquant_r1 import apply_backbone_r1
 from qai_hub_models.utils.aimet.aimet_dummy_model import zip_aimet_model
 from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
 from qai_hub_models.utils.aimet.encodings import apply_propagate_memory_encodings
@@ -1501,7 +1502,7 @@ class Pi05PaliGemmaBackboneBase(LoadPolicyMixin, BaseModel):
         return names
 
     def get_output_spec(self) -> OutputSpec:
-        return self.get_output_spec_static((0, 6))
+        return self.get_output_spec_static(self.layer_range)
 
 
 class Pi05PaliGemmaBackbone(Pi05PaliGemmaBackboneBase):
@@ -1527,11 +1528,13 @@ class Pi05PaliGemmaBackboneQuantizable(
         host_device: torch.device = torch.device("cpu"),
         onnx_bundle: ONNXBundle | None = None,
         precision: Precision = Precision.w4a16,
+        use_spinquant_r1: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
         self.host_device = host_device
         self._precision = precision
+        self._use_spinquant_r1 = use_spinquant_r1
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -1539,6 +1542,12 @@ class Pi05PaliGemmaBackboneQuantizable(
         param_type, act_type = aimet_quant_types(self._precision)
 
         onnx_model = self._onnx_bundle.load_onnx_model()
+        if self._use_spinquant_r1:
+            # Must run on the float model before QuantSimOnnx is built, so
+            # the quantizer scales computed below are calibrated on the
+            # rotated weights. See spinquant_r1.py for why this only
+            # rotates the backbone's internal weights, not an embedding.
+            apply_backbone_r1(onnx_model)
         quant_sim = QuantSimOnnx(
             model=onnx_model,
             quant_scheme=QuantScheme.min_max,
@@ -1570,6 +1579,7 @@ class Pi05PaliGemmaBackboneQuantizable(
         precision: Precision = Precision.w4a16,
         torch_from_pretrained_kwargs: dict[str, Any] | None = None,
         cls_kwargs: dict[str, Any] | None = None,
+        use_spinquant_r1: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         subfolder = subfolder or cls.default_subfolder
@@ -1580,7 +1590,11 @@ class Pi05PaliGemmaBackboneQuantizable(
             torch_to_onnx_options={"opset_version": 20},
         )
         return cls(
-            None, host_device=host_device, onnx_bundle=bundle, precision=precision
+            None,
+            host_device=host_device,
+            onnx_bundle=bundle,
+            precision=precision,
+            use_spinquant_r1=use_spinquant_r1,
         )
 
     def forward(  # type: ignore[override]
@@ -1936,6 +1950,7 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
         cls,
         checkpoint: str = "DEFAULT",
         host_device: torch.device | str = torch.device("cpu"),
+        use_spinquant_r1: bool = False,
     ) -> Pi05CollectionQuantized:
         return cls(
             Pi05PaliGemmaVisionQuantizable.from_pretrained(
@@ -1948,6 +1963,8 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
                 checkpoint=checkpoint, host_device=host_device
             ),
             Pi05PaliGemmaBackboneQuantizable.from_pretrained(
-                checkpoint=checkpoint, host_device=host_device
+                checkpoint=checkpoint,
+                host_device=host_device,
+                use_spinquant_r1=use_spinquant_r1,
             ),
         )

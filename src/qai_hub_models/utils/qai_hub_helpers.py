@@ -221,7 +221,12 @@ def export_torch_to_onnx_zip(
         zip_start_time = time.time()
         zip_path = f.with_name(f.name + ".zip")
         zip_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        # compresslevel=1 matches qai_hub's own zip_model() utility, which
+        # found this to be the sweet spot for large external-data files:
+        # ~48% size reduction in ~2 min, vs. 17+ min at the zlib default (6).
+        with zipfile.ZipFile(
+            zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1
+        ) as zip_file:
             for file_path in tmpdir2_path.iterdir():
                 # In the zip, files are placed under a folder named after the base name.
                 arcname = f.with_suffix("").name + "/" + file_path.name

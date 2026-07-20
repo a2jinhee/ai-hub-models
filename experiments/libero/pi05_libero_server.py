@@ -1,3 +1,7 @@
+# ---------------------------------------------------------------------
+# Copyright (c) 2025 Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause
+# ---------------------------------------------------------------------
 """pi05 inference server for decoupled LIBERO evaluation.
 
 Drop-in replacement for FastWAM's fastwam_server.py that serves Qualcomm AI
@@ -141,7 +145,9 @@ class Pi05InferenceServer:
         return {"action": a}
 
 
-def build_app(precision: str, checkpoint: str, device: str):
+def build_app(
+    precision: str, checkpoint: str, device: str, use_spinquant_r1: bool = False
+):
     logger.info("Loading PI05 policy (config/tokenizer) from %s ...", HF_MODEL_ID)
     policy = PI05Policy.from_pretrained(HF_MODEL_ID).to(device).eval()
 
@@ -151,15 +157,26 @@ def build_app(precision: str, checkpoint: str, device: str):
         config=policy.config, dataset_stats=ds.meta.stats
     )
 
+    if use_spinquant_r1 and precision != "quantized":
+        logger.warning(
+            "--use-spinquant-r1 has no effect with --precision float (the float "
+            "backbone's weights are never rotated); ignoring."
+        )
+        use_spinquant_r1 = False
+
     logger.info("Loading %s collection ...", precision)
     if precision == "quantized":
         collection = Pi05CollectionQuantized.from_pretrained(
-            checkpoint=checkpoint, host_device=device
+            checkpoint=checkpoint, host_device=device, use_spinquant_r1=use_spinquant_r1
         )
     else:
         collection = Pi05Collection.from_pretrained(host_device=device)
 
-    app = Pi05App(config=Pi05AppConfig.from_policy(policy), **collection.components).eval()
+    app = Pi05App(
+        config=Pi05AppConfig.from_policy(policy),
+        use_spinquant_r1=use_spinquant_r1,
+        **collection.components,
+    ).eval()
     logger.info("Pi05App ready. image_keys=%s", app.image_keys)
     return app, preprocessor, postprocessor
 
@@ -183,9 +200,20 @@ def main() -> None:
         action="store_true",
         help="Rotate images 180 deg on the server (only if client does NOT already flip).",
     )
+    ap.add_argument(
+        "--use-spinquant-r1",
+        action="store_true",
+        help=(
+            "Must match how the checkpoint's backbone was quantized "
+            "(see quantize.py --use-spinquant-r1). Only applies with "
+            "--precision quantized."
+        ),
+    )
     args = ap.parse_args()
 
-    app, preprocessor, postprocessor = build_app(args.precision, args.checkpoint, args.device)
+    app, preprocessor, postprocessor = build_app(
+        args.precision, args.checkpoint, args.device, args.use_spinquant_r1
+    )
     policy_server_impl = Pi05InferenceServer(
         app=app,
         preprocessor=preprocessor,
@@ -204,6 +232,7 @@ def main() -> None:
             "model": "pi05",
             "precision": args.precision,
             "checkpoint": args.checkpoint if args.precision == "quantized" else "float",
+            "use_spinquant_r1": args.use_spinquant_r1 and args.precision == "quantized",
             "num_steps": args.num_steps,
             "gripper_mode": args.gripper_mode,
         },

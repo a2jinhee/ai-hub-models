@@ -4,64 +4,64 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Evaluate Qualcomm AI Hub pi05 (quantized `build/pi05_mixed` or float) on the
-# LIBERO closed-loop benchmark, reusing the FastWAM model-agnostic websocket
-# client (fastwam_libero_client.py) + `libero` conda env.
+# Evaluate pi05 on LIBERO across three quantization settings:
 #
-# Architecture (two repos + two envs, one box, decoupled over a websocket):
-#   * pi05 policy server  -> ai-hub-models, `qc`     env (qai_hub_models + aimet_onnx + lerobot)
-#   * LIBERO sim client   -> FastWAM,       `libero` env (mujoco/robosuite rollouts)
-# The server (pi05_libero_server.py) is local to this repo; the client lives in
-# FastWAM, located via FASTWAM_REPO (default /home/jk656/FastWAM-jk).
-# This script launches the server, waits until it is serving, runs the client,
-# and always tears the server down on exit.
+#   float    - unquantized baseline (Pi05Collection)
+#   seqmse   - seq-MSE quantized vision_encoder + action_expert + backbone
+#   mixed    - seq-MSE quantized vision_encoder + action_expert,
+#              seq-MSE + SpinQuant (R1) quantized backbone (llm_backbone)
+#
+# CHECKPOINT_BASE (default build/pi05_mixed) is expected to contain:
+#   vision_encoder/   action_expert/   backbone/
+# `backbone` here is the seq-MSE-only backbone. The seq-MSE + SpinQuant
+# backbone lives separately under SPIN_CHECKPOINT_BASE (default
+# build/pi05_mixed_spin) as `backbone/`. Since pi05_libero_server.py always
+# loads a component named `backbone` from the checkpoint dir, this script
+# stages a small directory of symlinks per setting (vision_encoder/
+# action_expert shared from CHECKPOINT_BASE, backbone pointed at the right
+# variant) and passes that as --checkpoint.
+#
+# Both pieces are local to this repo (ai-hub-models), two conda envs:
+#   * pi05 policy server  -> `qc`     env -> pi05_libero_server.py
+#   * LIBERO sim client   -> `libero` env -> fastwam_libero_client.py (model-agnostic)
 #
 # USAGE
-#   ai-hub-models/experiments/libero/run_libero_pi05.sh [PRECISION] [SUITE] [TEST_NUM] [TASK_RANGE]
+#   ai-hub-models/experiments/libero/run_libero_pi05_settings.sh [SETTING] [SUITE] [TEST_NUM] [TASK_RANGE]
 #
-#   PRECISION   quantized | float | both      (default: quantized)
+#   SETTING     float | seqmse | mixed | all       (default: all)
 #   SUITE       libero_object | libero_spatial | libero_goal | libero_10 | all
-#                                              (default: libero_object)
-#   TEST_NUM    episodes per task             (default: 5)
+#                                                   (default: libero_object)
+#   TEST_NUM    episodes per task                  (default: 5)
 #   TASK_RANGE  "START END" (half-open) or "" for all tasks in the suite
-#                                              (default: "0 1"  -> only task 0)
+#                                                   (default: "0 1"  -> only task 0)
 #
 # Everything else is overridable via env vars (defaults in the CONFIG block):
-#   SERVER_GPU PORT NUM_STEPS GRIPPER_MODE CHECKPOINT OUT_ROOT
+#   SERVER_GPU PORT NUM_STEPS GRIPPER_MODE CHECKPOINT_BASE OUT_ROOT
 #   QAIHM_REPO FASTWAM_REPO CONDA_QC CONDA_LIBERO REPLAN_STEPS NUM_STEPS_WAIT
-#   SAVE_VIDEO READY_TIMEOUT CLIENT_GPU SPINQUANT_R1
-#
-#   SPINQUANT_R1=1 passes --use-spinquant-r1 to the server (quantized only).
-#   Must match how the backbone in CHECKPOINT was quantized -- see
-#   quantize.py --use-spinquant-r1.
+#   SAVE_VIDEO READY_TIMEOUT CLIENT_GPU
 #
 # EXAMPLES
-#   # Smoke test (validated): quantized, 1 task x 5 episodes on libero_object
-#   ai-hub-models/experiments/libero/run_libero_pi05.sh quantized libero_object 5 "0 1"
+#   # Smoke test: mixed setting, 1 task x 5 episodes on libero_object
+#   ai-hub-models/experiments/libero/run_libero_pi05_settings.sh mixed libero_object 5 "0 1"
 #
-#   # Full LIBERO reporting protocol: 50 ep/task, all 10 tasks, both precisions
-#   ai-hub-models/experiments/libero/run_libero_pi05.sh both libero_object 50 ""
-#
-#   # A different suite on a specific server GPU
-#   SERVER_GPU=3 ai-hub-models/experiments/libero/run_libero_pi05.sh quantized libero_10 20 ""
+#   # Full LIBERO reporting protocol: all 3 settings, 50 ep/task, all 10 tasks
+#   ai-hub-models/experiments/libero/run_libero_pi05_settings.sh all libero_object 50 ""
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 # ---- positional args ------------------------------------------------------
-PRECISION="${1:-quantized}"      # quantized | float | both
+SETTING="${1:-all}"              # float | seqmse | mixed | all
 SUITE="${2:-libero_object}"
 TEST_NUM="${3:-5}"
 TASK_RANGE="${4:-0 1}"           # "START END" or "" for all tasks
 
 # ---- CONFIG (env-overridable) ---------------------------------------------
-# This script lives in ai-hub-models and drives two repos:
-#   * pi05 server  -> ai-hub-models (QAIHM_REPO), qc env      -> local pi05_libero_server.py
-#   * LIBERO client -> FastWAM (FASTWAM_REPO), libero env     -> fastwam_libero_client.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QAIHM_REPO="${QAIHM_REPO:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"   # ai-hub-models root
 FASTWAM_REPO="${FASTWAM_REPO:-/home/jk656/FastWAM-jk}"           # repo with the LIBERO sim client
-CHECKPOINT="${CHECKPOINT:-${QAIHM_REPO}/build/pi05_mixed}"
-CONDA_QC="${CONDA_QC:-qc}"           # env with qai_hub_models + aimet_onnx
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-${QAIHM_REPO}/build/pi05_mixed}"
+SPIN_CHECKPOINT_BASE="${SPIN_CHECKPOINT_BASE:-${QAIHM_REPO}/build/pi05_mixed_spin}"  # holds the seq-MSE + SpinQuant backbone/
+CONDA_QC="${CONDA_QC:-qc}"           # env with qai_hub_models + aimet_onnx + lerobot
 CONDA_LIBERO="${CONDA_LIBERO:-libero}"  # env with the LIBERO simulator
 
 SERVER_GPU="${SERVER_GPU:-2}"        # GPU the pi05 server runs on
@@ -73,13 +73,13 @@ REPLAN_STEPS="${REPLAN_STEPS:-10}"
 NUM_STEPS_WAIT="${NUM_STEPS_WAIT:-30}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"        # 1 -> pass --save-video (default off; set SAVE_VIDEO=1 to record)
 READY_TIMEOUT="${READY_TIMEOUT:-600}"    # seconds to wait for server load
-OUT_ROOT="${OUT_ROOT:-${FASTWAM_REPO}/outputs/pi05_libero}"
-SPINQUANT_R1="${SPINQUANT_R1:-0}"    # 1 -> pass --use-spinquant-r1 to the server
+OUT_ROOT="${OUT_ROOT:-${QAIHM_REPO}/outputs/pi05_libero}"
+STAGE_ROOT="${OUT_ROOT}/_ckpt_staging"
 
 SERVER_PY="${SCRIPT_DIR}/pi05_libero_server.py"    # local (this repo, qc env)
 CLIENT_PY="${SCRIPT_DIR}/fastwam_libero_client.py" # local (this repo, libero env) -- model-agnostic
 
-mkdir -p "$OUT_ROOT"
+mkdir -p "$OUT_ROOT" "$STAGE_ROOT"
 
 # ---- helpers --------------------------------------------------------------
 SERVER_PID=""
@@ -109,28 +109,73 @@ wait_for_server() {
   echo "[run] ERROR: server not ready within ${READY_TIMEOUT}s. Last log lines:"; tail -30 "$log"; return 1
 }
 
+# stage_checkpoint DEST BACKBONE_SUBDIR [BACKBONE_BASE]
+# Builds a symlink tree DEST/{vision_encoder,action_expert,backbone}.
+# vision_encoder/action_expert are always taken from CHECKPOINT_BASE; the
+# backbone is taken from BACKBONE_BASE/BACKBONE_SUBDIR (BACKBONE_BASE defaults
+# to CHECKPOINT_BASE -- used by the seq-MSE-only setting; the SpinQuant setting
+# passes SPIN_CHECKPOINT_BASE). This is needed because Pi05CollectionQuantized
+# always loads a component literally named `backbone` from the checkpoint dir.
+stage_checkpoint() {
+  local dest="$1" backbone_subdir="$2" backbone_base="${3:-${CHECKPOINT_BASE}}"
+  local src_backbone="${backbone_base}/${backbone_subdir}"
+  for part in vision_encoder action_expert; do
+    if [[ ! -d "${CHECKPOINT_BASE}/${part}" ]]; then
+      echo "[run] ERROR: missing ${CHECKPOINT_BASE}/${part}" >&2; return 1
+    fi
+  done
+  if [[ ! -d "$src_backbone" ]]; then
+    echo "[run] ERROR: backbone checkpoint dir not found: ${src_backbone}" >&2
+    echo "[run]        (expected under BACKBONE_BASE=${backbone_base})" >&2
+    return 1
+  fi
+  mkdir -p "$dest"
+  ln -sfn "${CHECKPOINT_BASE}/vision_encoder" "${dest}/vision_encoder"
+  ln -sfn "${CHECKPOINT_BASE}/action_expert" "${dest}/action_expert"
+  ln -sfn "${src_backbone}" "${dest}/backbone"
+}
+
 run_one() {
-  local prec="$1"
-  local out_dir="${OUT_ROOT}/${prec}"
-  local server_log="${OUT_ROOT}/server_${prec}.log"
+  local setting="$1"
+  local prec spin backbone_subdir checkpoint
+  case "$setting" in
+    float)
+      prec=float; spin=0; checkpoint="${CHECKPOINT_BASE}"  # unused by server for float
+      ;;
+    seqmse)
+      prec=quantized; spin=0; backbone_subdir="backbone"
+      checkpoint="${STAGE_ROOT}/seqmse"
+      stage_checkpoint "$checkpoint" "$backbone_subdir"
+      ;;
+    mixed)
+      prec=quantized; spin=1; backbone_subdir="backbone"
+      checkpoint="${STAGE_ROOT}/mixed"
+      stage_checkpoint "$checkpoint" "$backbone_subdir" "$SPIN_CHECKPOINT_BASE"
+      ;;
+    *) echo "bad SETTING '${setting}' (use float|seqmse|mixed|all)"; return 2 ;;
+  esac
+
+  local out_dir="${OUT_ROOT}/${setting}"
+  local server_log="${OUT_ROOT}/server_${setting}.log"
   mkdir -p "$out_dir"
 
   echo "=================================================================="
-  echo "[run] precision=${prec}  suite=${SUITE}  test_num=${TEST_NUM}  task_range='${TASK_RANGE}'"
-  echo "[run] server_gpu=${SERVER_GPU}  port=${PORT}  num_steps=${NUM_STEPS}  gripper=${GRIPPER_MODE}  spinquant_r1=${SPINQUANT_R1}"
+  echo "[run] setting=${setting}  precision=${prec}  spinquant_r1=${spin}  suite=${SUITE}  test_num=${TEST_NUM}  task_range='${TASK_RANGE}'"
+  echo "[run] checkpoint=${checkpoint}"
+  echo "[run] server_gpu=${SERVER_GPU}  port=${PORT}  num_steps=${NUM_STEPS}  gripper=${GRIPPER_MODE}"
   echo "[run] out_dir=${out_dir}  server_log=${server_log}"
   echo "=================================================================="
 
   # 1) launch the pi05 policy server (qc env) in the background
   local server_args=(
     --precision "${prec}"
-    --checkpoint "${CHECKPOINT}"
+    --checkpoint "${checkpoint}"
     --device cuda
     --port "${PORT}"
     --num-steps "${NUM_STEPS}"
     --gripper-mode "${GRIPPER_MODE}"
   )
-  [[ "${SPINQUANT_R1}" == "1" ]] && server_args+=(--use-spinquant-r1)
+  [[ "${spin}" == "1" ]] && server_args+=(--use-spinquant-r1)
 
   PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="${SERVER_GPU}" \
     conda run --no-capture-output -n "${CONDA_QC}" python "${SERVER_PY}" \
@@ -167,17 +212,17 @@ run_one() {
     conda run --no-capture-output -n "${CONDA_LIBERO}" python "${CLIENT_PY}" "${client_args[@]}"
   fi
 
-  # 4) tear the server down before the next precision
+  # 4) tear the server down before the next setting
   cleanup; SERVER_PID=""
 
-  echo "[run] precision=${prec} DONE. Summary: ${out_dir}/${SUITE}_summary.json"
+  echo "[run] setting=${setting} DONE. Summary: ${out_dir}/${SUITE}_summary.json"
 }
 
 # ---- dispatch -------------------------------------------------------------
-case "${PRECISION}" in
-  quantized|float) run_one "${PRECISION}" ;;
-  both)            run_one quantized; run_one float ;;
-  *) echo "bad PRECISION '${PRECISION}' (use quantized|float|both)"; exit 2 ;;
+case "${SETTING}" in
+  float|seqmse|mixed) run_one "${SETTING}" ;;
+  all)                 run_one float; run_one seqmse; run_one mixed ;;
+  *) echo "bad SETTING '${SETTING}' (use float|seqmse|mixed|all)"; exit 2 ;;
 esac
 
 echo "[run] ALL DONE. Results under: ${OUT_ROOT}"

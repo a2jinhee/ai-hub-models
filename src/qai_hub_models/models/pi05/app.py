@@ -24,6 +24,7 @@ from qai_hub_models.models.pi05.model import (
     Pi05PaliGemmaTokenEmbed,
     Pi05PaliGemmaVision,
 )
+from qai_hub_models.models.pi05.spinquant_r1 import get_r1_matrix, rotate_activation
 from qai_hub_models.protocols import ExecutableModelProtocol
 from qai_hub_models.utils.base_collection_model import WorkbenchModelCollection
 from qai_hub_models.utils.evaluate.helpers import sample_dataset
@@ -131,6 +132,7 @@ class Pi05App(torch.nn.Module):
         token_emb: ExecutableModelProtocol,
         action_expert: ExecutableModelProtocol,
         backbone: ExecutableModelProtocol,
+        use_spinquant_r1: bool = False,
     ) -> None:
         """
         Initialize Pi05App with model components.
@@ -147,8 +149,15 @@ class Pi05App(torch.nn.Module):
             Action expert component for denoising.
         backbone
             Full backbone (layers 0-18).
+        use_spinquant_r1
+            Whether `backbone` was quantized with SpinQuant R1 (see
+            Pi05PaliGemmaBackboneQuantizable). If True, hidden_state is
+            rotated before being passed to the backbone, matching the
+            rotation baked into its weights. See spinquant_r1.py.
         """
         super().__init__()
+        self._use_spinquant_r1 = use_spinquant_r1
+        self._r1_matrix: torch.Tensor | None = None
 
         # When components are OnDeviceModel instances, wrap them so that
         # call sites can pass batched tensors directly (like a torch module).
@@ -180,6 +189,14 @@ class Pi05App(torch.nn.Module):
         self.action_dof = config.action_dof
         # Whether to use RTC-unrolled expert during inference.
         self.use_rtc: bool = bool(config.use_rtc)
+
+    def _get_r1_matrix(self, prefix_emb: torch.Tensor) -> torch.Tensor:
+        """Lazily build (and cache) the R1 matrix, sized from prefix_emb's hidden dim."""
+        if self._r1_matrix is None:
+            self._r1_matrix = get_r1_matrix(
+                prefix_emb.shape[-1], dtype=prefix_emb.dtype
+            ).to(prefix_emb.device)
+        return self._r1_matrix
 
     def _resize_and_normalize_image(self, image: torch.Tensor) -> torch.Tensor:
         if image.ndim != 4:
@@ -286,6 +303,9 @@ class Pi05App(torch.nn.Module):
             suffix_cos,
             full_att_4d,
         ) = te_out
+
+        if self._use_spinquant_r1:
+            prefix_emb = rotate_activation(prefix_emb, self._get_r1_matrix(prefix_emb))
 
         # Run PaliGemma backbone to fill per-layer KV caches for the
         # prefix.
@@ -518,6 +538,7 @@ class Pi05App(torch.nn.Module):
         component_name: str,
         input_specs: dict[str, InputSpec] | None = None,
         num_samples: int | None = None,
+        use_spinquant_r1: bool = False,
     ) -> DatasetEntries:
         """
         Build calibration data starting from the LIBERO dataset.
@@ -530,6 +551,15 @@ class Pi05App(torch.nn.Module):
         The upstream components are read from collection_model.components and
         must be float torch modules (use the float Pi05Collection, not the
         quantizable collection whose components are ONNX-wrapped).
+
+        use_spinquant_r1 only affects the "backbone" branch: hidden_state
+        calibration inputs are rotated to match a backbone quantized with
+        SpinQuant R1 (Pi05PaliGemmaBackboneQuantizable). It does not apply
+        to "action_expert" -- that branch runs the float, never-rotated
+        Pi05PaliGemmaBackbone purely to produce KV-cache values, which are
+        unaffected by R1 (R1's reading-layer rotation is designed to leave
+        attention K/Q/V and MLP activations numerically unchanged; see
+        spinquant_r1.py).
         """
         if component_name == "token_emb":
             raise NotImplementedError("token_emb is not quantized")
@@ -601,6 +631,11 @@ class Pi05App(torch.nn.Module):
                         _suffix_cos,
                         _full_att_4d,
                     ) = token_emb(lang_tokens, lang_mask, *img_embeds)
+                if use_spinquant_r1:
+                    R1 = get_r1_matrix(prefix_emb.shape[-1], dtype=prefix_emb.dtype).to(
+                        prefix_emb.device
+                    )
+                    prefix_emb = rotate_activation(prefix_emb, R1)
                 tensors_per_input[0].append(prefix_emb)
                 tensors_per_input[1].append(prefix_att_2d)
                 tensors_per_input[2].append(prefix_sin)

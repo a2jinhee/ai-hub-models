@@ -141,3 +141,5 @@ src/qai_hub_models/**/HF_MODEL_CARD.md
 # TODO: #12151 wt shared llama binary support in export.py
 !src/qai_hub_models/models/llama_v2_7b_chat/gen_ondevice_llama/README.md
 !src/qai_hub_models/scorecard/intermediates/accuracy.csv
+
+outputs

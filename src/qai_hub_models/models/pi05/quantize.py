@@ -12,6 +12,13 @@ Usage:
     python -m qai_hub_models.models.pi05.quantize --component vision_encoder
     python -m qai_hub_models.models.pi05.quantize --component backbone
     python -m qai_hub_models.models.pi05.quantize --component action_expert
+
+    # Optionally rotate the backbone's weights with SpinQuant R1:
+    python -m qai_hub_models.models.pi05.quantize --component backbone --use-spinquant-r1
+
+If backbone is quantized with --use-spinquant-r1, the deployment/eval path
+(Pi05App, e.g. pi05_libero_server.py) must also be run with R1 enabled, so
+hidden_state is rotated to match the backbone's rotated weights.
 """
 
 from __future__ import annotations
@@ -82,7 +89,23 @@ def main() -> None:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="One of cpu, cuda. Run QuantSim calibration on this host device.",
     )
+    parser.add_argument(
+        "--use-spinquant-r1",
+        action="store_true",
+        help=(
+            "Apply SpinQuant R1 rotation to the backbone's internal weights "
+            "before calibration (only affects --component backbone; ignored "
+            "otherwise). hidden_state calibration inputs are rotated to "
+            "match. See spinquant_r1.py."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.use_spinquant_r1 and args.component != "backbone":
+        print(
+            f"--use-spinquant-r1 has no effect on --component {args.component} "
+            "(only the backbone is rotated); ignoring."
+        )
 
     torch.manual_seed(args.seed)
 
@@ -100,10 +123,15 @@ def main() -> None:
 
     print(f"Quantizing component={args.component} precision={precision}")
 
+    from_pretrained_kwargs: dict = {}
+    if args.component == "backbone":
+        from_pretrained_kwargs["use_spinquant_r1"] = args.use_spinquant_r1
+
     component = QCls.from_pretrained(
         checkpoint=args.checkpoint,
         host_device=host_device,
         precision=precision,
+        **from_pretrained_kwargs,
     )
 
     # Float collection whose components run float forward passes; used to build
@@ -115,6 +143,7 @@ def main() -> None:
         fp_collection,
         args.component,
         num_samples=args.num_samples,
+        use_spinquant_r1=args.use_spinquant_r1,
     )
     data_loader = dataset_entries_to_dataloader(ds)
 
