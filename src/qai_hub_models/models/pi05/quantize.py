@@ -16,6 +16,9 @@ Usage:
     # Optionally rotate the backbone's weights with SpinQuant R1:
     python -m qai_hub_models.models.pi05.quantize --component backbone --use-spinquant-r1
 
+    # Override the default per-component precision (e.g. action_expert at w4a16):
+    python -m qai_hub_models.models.pi05.quantize --component action_expert --precision w4a16
+
 If backbone is quantized with --use-spinquant-r1, the deployment/eval path
 (Pi05App, e.g. pi05_libero_server.py) must also be run with R1 enabled, so
 hidden_state is rotated to match the backbone's rotated weights.
@@ -72,6 +75,15 @@ def main() -> None:
         help=f"Directory where quantized checkpoint should be stored. Defaults to ./build/{MODEL_ID}_<precision>.",
     )
     parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+        help=(
+            "Override the default per-component precision from MIXED_PRECISION_MAP "
+            "(e.g. 'w4a16', 'w8a16'). Defaults to the mixed-precision mapping."
+        ),
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
         default=100,
@@ -111,7 +123,11 @@ def main() -> None:
 
     host_device = torch.device(args.host_device)
 
-    precision = MIXED_PRECISION_MAP[args.component]
+    precision = (
+        Precision.parse(args.precision)
+        if args.precision
+        else MIXED_PRECISION_MAP[args.component]
+    )
 
     QCls: type
     if args.component == "vision_encoder":
