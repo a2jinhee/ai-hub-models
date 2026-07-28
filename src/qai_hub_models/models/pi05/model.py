@@ -42,7 +42,11 @@ from qai_hub_models.models.pi05.model_adaptation import (
     SHAGemmaExpertAttention,
     apply_rope_direct,
 )
-from qai_hub_models.models.pi05.spinquant_r1 import apply_backbone_r1
+from qai_hub_models.models.pi05.spinquant_r1 import (
+    apply_action_expert_r2,
+    apply_backbone_rotations,
+    read_rotation_marker,
+)
 from qai_hub_models.utils.aimet.aimet_dummy_model import zip_aimet_model
 from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
 from qai_hub_models.utils.aimet.encodings import apply_propagate_memory_encodings
@@ -1529,12 +1533,14 @@ class Pi05PaliGemmaBackboneQuantizable(
         onnx_bundle: ONNXBundle | None = None,
         precision: Precision = Precision.w4a16,
         use_spinquant_r1: bool = False,
+        use_spinquant_r2: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
         self.host_device = host_device
         self._precision = precision
         self._use_spinquant_r1 = use_spinquant_r1
+        self._use_spinquant_r2 = use_spinquant_r2
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -1546,8 +1552,10 @@ class Pi05PaliGemmaBackboneQuantizable(
             # Must run on the float model before QuantSimOnnx is built, so
             # the quantizer scales computed below are calibrated on the
             # rotated weights. See spinquant_r1.py for why this only
-            # rotates the backbone's internal weights, not an embedding.
-            apply_backbone_r1(onnx_model)
+            # rotates the backbone's internal weights, not an embedding,
+            # and for why R2 additionally requires a compensating action
+            # expert (not yet implemented).
+            apply_backbone_rotations(onnx_model, enable_r2=self._use_spinquant_r2)
         quant_sim = QuantSimOnnx(
             model=onnx_model,
             quant_scheme=QuantScheme.min_max,
@@ -1580,6 +1588,7 @@ class Pi05PaliGemmaBackboneQuantizable(
         torch_from_pretrained_kwargs: dict[str, Any] | None = None,
         cls_kwargs: dict[str, Any] | None = None,
         use_spinquant_r1: bool = False,
+        use_spinquant_r2: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         subfolder = subfolder or cls.default_subfolder
@@ -1595,6 +1604,7 @@ class Pi05PaliGemmaBackboneQuantizable(
             onnx_bundle=bundle,
             precision=precision,
             use_spinquant_r1=use_spinquant_r1,
+            use_spinquant_r2=use_spinquant_r2,
         )
 
     def forward(  # type: ignore[override]
@@ -1633,11 +1643,13 @@ class Pi05ActionExpertQuantizable(
         host_device: torch.device = torch.device("cpu"),
         onnx_bundle: ONNXBundle | None = None,
         precision: Precision = Precision.w8a16,
+        use_spinquant_r2: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
         self.host_device = host_device
         self._precision = precision
+        self._use_spinquant_r2 = use_spinquant_r2
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -1645,6 +1657,12 @@ class Pi05ActionExpertQuantizable(
         param_type, act_type = aimet_quant_types(self._precision)
 
         onnx_model = self._onnx_bundle.load_onnx_model()
+        if self._use_spinquant_r2:
+            # Compensates the R2 rotation baked into the backbone's exported V
+            # caches. Must run on the float model before QuantSimOnnx is built,
+            # so scales are calibrated on the rotated weights. Only valid
+            # against an R2 backbone -- see spinquant_r1.py.
+            apply_action_expert_r2(onnx_model)
         quant_sim = QuantSimOnnx(
             model=onnx_model,
             quant_scheme=QuantScheme.min_max,
@@ -1682,6 +1700,7 @@ class Pi05ActionExpertQuantizable(
         precision: Precision = Precision.w8a16,
         torch_from_pretrained_kwargs: dict[str, Any] | None = None,
         cls_kwargs: dict[str, Any] | None = None,
+        use_spinquant_r2: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         ckpt_type = CheckpointType.from_checkpoint(checkpoint, subfolder="")
@@ -1696,7 +1715,11 @@ class Pi05ActionExpertQuantizable(
                 torch_to_onnx_options={"opset_version": 20},
             )
         return cls(
-            None, host_device=host_device, onnx_bundle=bundle, precision=precision
+            None,
+            host_device=host_device,
+            onnx_bundle=bundle,
+            precision=precision,
+            use_spinquant_r2=use_spinquant_r2,
         )
 
     def serialize(
@@ -1952,6 +1975,22 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
         host_device: torch.device | str = torch.device("cpu"),
         use_spinquant_r1: bool = False,
     ) -> Pi05CollectionQuantized:
+        # R2 couples the two components: the backbone exports V caches rotated
+        # by R2 and the expert's o_proj absorbs the inverse. Mixing an R2
+        # component with a non-R2 one runs without error but yields wrong
+        # actions, so refuse the mismatch here. See spinquant_r1.py.
+        root = Path(str(checkpoint))
+        backbone_ckpt, expert_ckpt = root / "backbone", root / "action_expert"
+        if backbone_ckpt.is_dir() and expert_ckpt.is_dir():
+            backbone_r2 = read_rotation_marker(backbone_ckpt)["r2"]
+            expert_r2 = read_rotation_marker(expert_ckpt)["r2"]
+            if backbone_r2 != expert_r2:
+                raise ValueError(
+                    f"SpinQuant R2 mismatch in '{root}': backbone r2={backbone_r2} "
+                    f"but action_expert r2={expert_r2}. R2 rotates the V caches "
+                    "the backbone hands the expert, so both components must be "
+                    "built with the same setting."
+                )
         return cls(
             Pi05PaliGemmaVisionQuantizable.from_pretrained(
                 checkpoint=checkpoint, host_device=host_device

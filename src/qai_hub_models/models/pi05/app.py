@@ -24,7 +24,11 @@ from qai_hub_models.models.pi05.model import (
     Pi05PaliGemmaTokenEmbed,
     Pi05PaliGemmaVision,
 )
-from qai_hub_models.models.pi05.spinquant_r1 import get_r1_matrix, rotate_activation
+from qai_hub_models.models.pi05.spinquant_r1 import (
+    get_r1_matrix,
+    get_r2_matrix,
+    rotate_activation,
+)
 from qai_hub_models.protocols import ExecutableModelProtocol
 from qai_hub_models.utils.base_collection_model import WorkbenchModelCollection
 from qai_hub_models.utils.evaluate.helpers import sample_dataset
@@ -539,6 +543,7 @@ class Pi05App(torch.nn.Module):
         input_specs: dict[str, InputSpec] | None = None,
         num_samples: int | None = None,
         use_spinquant_r1: bool = False,
+        use_spinquant_r2: bool = False,
     ) -> DatasetEntries:
         """
         Build calibration data starting from the LIBERO dataset.
@@ -560,6 +565,14 @@ class Pi05App(torch.nn.Module):
         unaffected by R1 (R1's reading-layer rotation is designed to leave
         attention K/Q/V and MLP activations numerically unchanged; see
         spinquant_r1.py).
+
+        use_spinquant_r2 is the mirror image: it only affects the
+        "action_expert" branch. R2 *does* change the exported V caches, so the
+        recorded value_cache_l* calibration tensors are rotated to match what
+        an R2 backbone will feed the expert at inference. The float expert
+        driving the Euler loop is still run on the unrotated caches, so x_t
+        follows the true trajectory -- R2 is exactly cancelling, so the rotated
+        and unrotated pipelines produce the same actions.
         """
         if component_name == "token_emb":
             raise NotImplementedError("token_emb is not quantized")
@@ -697,6 +710,16 @@ class Pi05App(torch.nn.Module):
                     kv_kwargs[f"key_cache_l{i}"] = k_caches[i]
                     kv_kwargs[f"value_cache_l{i}"] = v_caches[i]
 
+                # An R2 backbone exports V caches rotated per head, so record
+                # the rotated tensors as calibration inputs. kv_kwargs stays
+                # unrotated: it drives the float, unrotated expert below, whose
+                # job is to produce the true x_t trajectory.
+                if use_spinquant_r2:
+                    R2 = get_r2_matrix(v_caches[0].shape[-1])
+                    v_caches_recorded = [rotate_activation(v, R2) for v in v_caches]
+                else:
+                    v_caches_recorded = v_caches
+
                 x_t = torch.randn(1, NUM_ACTION_STEPS, state_dim, device=device)
                 dt = -1.0 / float(num_steps)
                 t_cur = 1.0
@@ -708,7 +731,7 @@ class Pi05App(torch.nn.Module):
                     tensors_per_input[4].append(torch.tensor([t_cur], device=device))
                     for i in range(18):
                         tensors_per_input[5 + i].append(k_caches[i])
-                        tensors_per_input[23 + i].append(v_caches[i])
+                        tensors_per_input[23 + i].append(v_caches_recorded[i])
 
                     v_t = action_expert._compute_update(
                         full_att_4d=full_att_4d,
