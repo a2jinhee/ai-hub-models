@@ -13,18 +13,34 @@ rotation of the backbone's internal weights (done via
 `aimet_onnx.experimental.spinquant.apply_spinquant` in make_quant_sim)
 requires `hidden_state` to arrive pre-rotated: hidden_state_rot = hidden_state @ R1.
 
-Rather than rotating the weights that produce hidden_state (the vision
-projector and the language embedding table, which live in components
-that are shared -- via Pi05's lru_cache'd load_checkpoint -- with other,
-unrotated components in the same process), we rotate the activation
-directly wherever hidden_state is produced. This is mathematically
-equivalent: rotating a writing layer's weight by R1 and then evaluating
-it is identical to evaluating the unrotated layer and rotating its
-output by R1, and R1 (acting on the hidden axis) commutes with
-concatenation along the sequence axis. So rotating the vision projector
-and embedding table weights individually and rotating their
-concatenated output afterward produce the same result -- we just do the
-latter, in app.py, since it touches no shared checkpoint state.
+That rotation is folded into the weights that *produce* hidden_state, which
+is what AIMET does for the equivalent VLM topology (a backbone exported with
+use_inputs_embeds=True): see `_rotate_merger_linear2` and
+`_rotate_external_embedding` in aimet_onnx's R1RotationPass. hidden_state is
+
+    prefix_emb = concat([img_embed, ..., lang_emb], dim=seq)
+
+and R1 acts on the hidden axis, so it commutes with the sequence-axis concat.
+Rotating each producer independently therefore yields a rotated concatenation:
+
+  1. vision projector   -- apply_vision_r1, folds R1 into the multi_modal
+     projector's weight *and* bias (the last MatMul+Add of the vision ONNX)
+  2. language embedding -- rotate_embedding_weight, W <- W @ R1 on the
+     [vocab, hidden] table, folded at Pi05PaliGemmaTokenEmbed build time
+  3. zero padding for absent cameras -- 0 @ R1 == 0, nothing to do
+
+Folding rather than rotating the activation at runtime matters for the device
+export: an activation rotation is a [968, 2048] @ [2048, 2048] matmul that
+lives in no exported graph, so it would land on the host between two NPU
+components -- exactly the online-rotation cost R3/R4 were dropped to avoid.
+Folding also puts R1 *before* the vision encoder's output quantizer, so the
+vision->backbone activation is calibrated on rotated (outlier-suppressed)
+values instead of unrotated ones.
+
+The shared, lru_cache'd `load_checkpoint` policy is never mutated: the vision
+rotation edits the exported ONNX ModelProto, and the embedding rotation is
+held as a buffer on Pi05PaliGemmaTokenEmbed rather than written back into the
+shared nn.Embedding.
 
 R2 (per-head V/O rotation) carries an extra obligation on Pi05 that it does
 not carry on a plain LLM. R2's correctness argument is that the rotation of
@@ -83,6 +99,7 @@ from aimet_onnx.experimental.spinquant.transforms import (
     rotate_linear_weight,
 )
 from aimet_onnx.meta.connectedgraph import ConnectedGraph
+from aimet_onnx.meta.operations import Op
 
 # AIMET matches V projections by module name against
 # `^(v_proj|value|v)(_sha)?(\.\d+)?$`, which accepts a dot-separated head index
@@ -140,8 +157,133 @@ def get_r2_matrix(head_dim: int, dtype: torch.dtype = torch.float32) -> torch.Te
 
 
 def rotate_activation(x: torch.Tensor, R1: torch.Tensor) -> torch.Tensor:
-    """Rotate the last (hidden) dimension of an activation tensor: x @ R1."""
+    """
+    Rotate the last (hidden) dimension of an activation tensor: x @ R1.
+
+    Only used on the host-side calibration path, where the float (unrotated)
+    vision encoder and token embedder build backbone calibration inputs. The
+    deployed path has R1 folded into those components' weights instead -- see
+    apply_vision_r1 and rotate_embedding_weight.
+    """
     return x @ R1.to(dtype=x.dtype, device=x.device)
+
+
+def rotate_embedding_weight(weight: torch.Tensor) -> torch.Tensor:
+    """
+    Return the language embedding table rotated by R1: ``W @ R1``.
+
+    Mirrors AIMET's `_rotate_external_embedding`, which rotates the embedding
+    tensor of a VLM backbone exported with use_inputs_embeds=True. Pi05 keeps
+    its embedding inside Pi05PaliGemmaTokenEmbed rather than in a separate
+    embedding.pth, so the rotated table is returned for the caller to hold as a
+    buffer -- the shared checkpoint's nn.Embedding is left untouched.
+
+    Accumulates in float64 before casting back, matching AIMET's convention for
+    weight-space rotations.
+
+    Parameters
+    ----------
+    weight
+        Embedding table of shape [vocab, hidden].
+
+    Returns
+    -------
+    rotated : torch.Tensor
+        ``weight @ R1``, same shape and dtype as ``weight``.
+    """
+    if weight.ndim != 2:
+        raise ValueError(
+            f"Embedding table must be [vocab, hidden], got {weight.shape}."
+        )
+    R1 = get_r1_matrix(weight.shape[-1], dtype=torch.float64).to(weight.device)
+    return (weight.detach().to(torch.float64) @ R1).to(weight.dtype)
+
+
+def _find_output_projection(onnx_model: onnx.ModelProto, cg: ConnectedGraph) -> Op:
+    """
+    Return the linear op that writes the vision encoder's single graph output.
+
+    Walks back from the graph output through an optional bias `Add` to the
+    producing MatMul/Gemm/Conv. AIMET's own `find_merger_linear2` matches Qwen
+    PatchMerger module names, which Pi05's PaliGemma projector does not use, so
+    the op is located structurally instead.
+    """
+    outputs = onnx_model.graph.output
+    if len(outputs) != 1:
+        raise ValueError(
+            "apply_vision_r1 expects the vision encoder to have exactly one "
+            f"graph output, found {[o.name for o in outputs]}."
+        )
+    producers = {out: n for n in onnx_model.graph.node for out in n.output}
+    initializers = {i.name for i in onnx_model.graph.initializer}
+
+    node = producers.get(outputs[0].name)
+    if node is None:
+        raise ValueError(
+            f"Vision encoder output '{outputs[0].name}' has no producing node."
+        )
+    if node.op_type == "Add":
+        # MatMul + bias Add: step back to the MatMul on the non-static input.
+        activations = [i for i in node.input if i not in initializers]
+        if len(activations) != 1:
+            raise ValueError(
+                f"Vision encoder output Add '{node.name}' should have exactly one "
+                f"non-static input, found {activations}."
+            )
+        node = producers.get(activations[0])
+
+    if node is None or node.op_type not in ("MatMul", "Gemm", "Conv"):
+        found = node.op_type if node is not None else "None"
+        raise ValueError(
+            "Cannot locate the vision encoder's output projection: expected a "
+            f"MatMul/Gemm/Conv writing the graph output, found '{found}'."
+        )
+    return cg.get_op_from_module_name(node.name)
+
+
+def apply_vision_r1(
+    onnx_model: onnx.ModelProto, *, hidden_size: int | None = None
+) -> str:
+    """
+    Fold R1 into the vision encoder's output projection, in place.
+
+    The vision encoder already includes PaliGemma's multi_modal_projector, so
+    its graph output `img_embed` is in backbone hidden space. Rotating that
+    projection as a writing layer (``W <- W @ R1``, and the bias likewise) makes
+    the encoder emit embeddings already in the rotated residual stream, so the
+    backbone's rotated weights consume them directly.
+
+    This is the Pi05 analogue of AIMET's `_rotate_merger_linear2`, and uses
+    AIMET's own `rotate_linear_weight`, which rotates the bias too when
+    is_writing=True (its `get_bias_product` handles the MatMul-then-Add form
+    this projector exports as).
+
+    Parameters
+    ----------
+    onnx_model
+        Vision encoder ONNX model. Mutated in place.
+    hidden_size
+        Expected backbone hidden size. Inferred from the projection's output
+        axis when omitted; when given, a mismatch raises rather than silently
+        rotating the wrong axis.
+
+    Returns
+    -------
+    op_name : str
+        Name of the op that was rotated.
+    """
+    cg = ConnectedGraph(onnx_model)
+    op = _find_output_projection(onnx_model, cg)
+    out_size = _get_rotated_axis_size(onnx_model, op, is_writing=True)
+    if hidden_size is not None and out_size != hidden_size:
+        raise ValueError(
+            f"Vision projector '{op.name}' writes {out_size} channels, but the "
+            f"backbone hidden size is {hidden_size}."
+        )
+    rotate_linear_weight(
+        onnx_model, op, hadamard_rotation_matrix(out_size), is_writing=True
+    )
+    return op.name
 
 
 @contextmanager
@@ -249,19 +391,17 @@ def apply_backbone_rotations(
 
     R1 rotates the residual stream (qkv, o_proj, gate_up, down_proj across all
     layers). This calls the same analysis/rotation AIMET's public
-    aimet_onnx.experimental.spinquant.apply_spinquant uses, but without its
-    embedding/visual-model handling: Pi05's backbone graph has no in-graph
-    embed_tokens or lm_head (it takes a pre-embedded hidden_state as
-    input), so apply_spinquant's mandatory embedding-consistency check
-    doesn't apply here -- the equivalent rotation of hidden_state is
-    applied as an activation instead (see rotate_activation and its
-    module docstring).
+    aimet_onnx.experimental.spinquant.apply_spinquant uses, but drives the
+    passes directly rather than going through apply_spinquant: that entry point
+    requires either an in-graph embed_tokens or an external embedding tensor,
+    and Pi05 has neither -- its embedding lives in a separate exported
+    component. The equivalent producer-side rotations are applied there instead,
+    by apply_vision_r1 and rotate_embedding_weight.
 
     R2 additionally rotates each block's V output channels and o_proj input
-    rows per head. It leaves hidden_state_out bit-identical, but rotates the
+    rows per head. It leaves the K caches bit-identical, but rotates the
     exported per-layer V caches -- which makes the resulting backbone valid
-    only against a compensating action expert. See the module docstring; that
-    compensation is not implemented yet.
+    only against an action expert built with apply_action_expert_r2.
 
     Parameters
     ----------

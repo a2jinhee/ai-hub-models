@@ -43,6 +43,7 @@ from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
 from qai_hub_models.models.pi05.app import Pi05App, Pi05AppConfig
 from qai_hub_models.models.pi05.model import Pi05Collection, Pi05CollectionQuantized
+from qai_hub_models.models.pi05.spinquant_r1 import read_rotation_marker
 
 # Make the local `deploy` package importable (websocket server + msgpack).
 _this_dir = Path(__file__).resolve().parent
@@ -57,9 +58,9 @@ HF_MODEL_ID = "lerobot/pi05_libero_finetuned"
 DATASET_REPO_ID = "HuggingFaceVLA/libero"
 
 # pi05 camera keys (from config.input_features); the app ignores "empty_camera_0".
-KEY_PRIMARY = "observation.images.image"   # agentview / base camera
-KEY_WRIST = "observation.images.image2"    # wrist / eye-in-hand camera
-KEY_STATE = "observation.state"            # 8-D proprio (app ignores it)
+KEY_PRIMARY = "observation.images.image"  # agentview / base camera
+KEY_WRIST = "observation.images.image2"  # wrist / eye-in-hand camera
+KEY_STATE = "observation.state"  # 8-D proprio (app ignores it)
 
 
 def _img_to_chw01(img_hwc: np.ndarray) -> torch.Tensor:
@@ -132,7 +133,9 @@ class Pi05InferenceServer:
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device)
 
-        pred = self.app.predict_action_chunk(batch=batch, noise=None, num_steps=self.num_steps)
+        pred = self.app.predict_action_chunk(
+            batch=batch, noise=None, num_steps=self.num_steps
+        )
         actions = self.postprocessor(pred)
         if isinstance(actions, torch.Tensor):
             a = actions.detach().float().cpu().numpy()
@@ -145,9 +148,22 @@ class Pi05InferenceServer:
         return {"action": a}
 
 
-def build_app(
-    precision: str, checkpoint: str, device: str, use_spinquant_r1: bool = False
-):
+def describe_rotations(checkpoint: str) -> dict[str, bool]:
+    """Report the SpinQuant rotations baked into a quantized checkpoint.
+
+    The markers written by quantize.py are the single source of truth --
+    rotations live in the components' weights, so nothing needs to be enabled
+    at load time. Pi05CollectionQuantized.from_pretrained refuses a set whose
+    markers disagree, so this is purely for logging.
+    """
+    root = Path(checkpoint)
+    return {
+        "r1": read_rotation_marker(root / "backbone")["r1"],
+        "r2": read_rotation_marker(root / "backbone")["r2"],
+    }
+
+
+def build_app(precision: str, checkpoint: str, device: str):
     logger.info("Loading PI05 policy (config/tokenizer) from %s ...", HF_MODEL_ID)
     policy = PI05Policy.from_pretrained(HF_MODEL_ID).to(device).eval()
 
@@ -157,24 +173,22 @@ def build_app(
         config=policy.config, dataset_stats=ds.meta.stats
     )
 
-    if use_spinquant_r1 and precision != "quantized":
-        logger.warning(
-            "--use-spinquant-r1 has no effect with --precision float (the float "
-            "backbone's weights are never rotated); ignoring."
-        )
-        use_spinquant_r1 = False
-
     logger.info("Loading %s collection ...", precision)
     if precision == "quantized":
+        rotations = describe_rotations(checkpoint)
+        logger.info(
+            "Checkpoint SpinQuant rotations: r1=%s r2=%s (baked into weights).",
+            rotations["r1"],
+            rotations["r2"],
+        )
         collection = Pi05CollectionQuantized.from_pretrained(
-            checkpoint=checkpoint, host_device=device, use_spinquant_r1=use_spinquant_r1
+            checkpoint=checkpoint, host_device=device
         )
     else:
         collection = Pi05Collection.from_pretrained(host_device=device)
 
     app = Pi05App(
         config=Pi05AppConfig.from_policy(policy),
-        use_spinquant_r1=use_spinquant_r1,
         **collection.components,
     ).eval()
     logger.info("Pi05App ready. image_keys=%s", app.image_keys)
@@ -184,11 +198,15 @@ def build_app(
 def main() -> None:
     ap = argparse.ArgumentParser(description="pi05 LIBERO inference server")
     ap.add_argument("--precision", choices=["quantized", "float"], default="quantized")
-    ap.add_argument("--checkpoint", default="/home/jk656/ai-hub-models/build/pi05_mixed")
+    ap.add_argument(
+        "--checkpoint", default="/home/jk656/ai-hub-models/build/pi05_mixed"
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=23908)
-    ap.add_argument("--num-steps", type=int, default=10, help="Flow-matching Euler steps")
+    ap.add_argument(
+        "--num-steps", type=int, default=10, help="Flow-matching Euler steps"
+    )
     ap.add_argument(
         "--gripper-mode",
         choices=["direct", "flip", "binarize", "flip_binarize"],
@@ -204,15 +222,22 @@ def main() -> None:
         "--use-spinquant-r1",
         action="store_true",
         help=(
-            "Must match how the checkpoint's backbone was quantized "
-            "(see quantize.py --use-spinquant-r1). Only applies with "
-            "--precision quantized."
+            "Deprecated no-op. SpinQuant rotations are folded into the "
+            "checkpoint's weights and read from its markers; nothing needs "
+            "enabling at serve time."
         ),
     )
     args = ap.parse_args()
 
+    if args.use_spinquant_r1:
+        logger.warning(
+            "--use-spinquant-r1 is a no-op and will be removed. Rotations are "
+            "folded into the checkpoint's weights (vision projector, embedding "
+            "table, backbone) and detected from its markers."
+        )
+
     app, preprocessor, postprocessor = build_app(
-        args.precision, args.checkpoint, args.device, args.use_spinquant_r1
+        args.precision, args.checkpoint, args.device
     )
     policy_server_impl = Pi05InferenceServer(
         app=app,
@@ -232,12 +257,21 @@ def main() -> None:
             "model": "pi05",
             "precision": args.precision,
             "checkpoint": args.checkpoint if args.precision == "quantized" else "float",
-            "use_spinquant_r1": args.use_spinquant_r1 and args.precision == "quantized",
+            "spinquant": (
+                describe_rotations(args.checkpoint)
+                if args.precision == "quantized"
+                else {"r1": False, "r2": False}
+            ),
             "num_steps": args.num_steps,
             "gripper_mode": args.gripper_mode,
         },
     )
-    logger.info("Starting pi05 server on %s:%d (precision=%s)", args.host, args.port, args.precision)
+    logger.info(
+        "Starting pi05 server on %s:%d (precision=%s)",
+        args.host,
+        args.port,
+        args.precision,
+    )
     server.serve_forever()
 
 

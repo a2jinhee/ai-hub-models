@@ -23,13 +23,15 @@ run_libero_pi05.sh / run_libero_pi05_settings.sh).
 Usage:
     conda run -n qc python profile_pi05_mixed.py \
         --checkpoint /home/jk656/ai-hub-models/build/pi05_mixed_spin_actionw4 \
-        --use-spinquant-r1 \
         --device "Dragonwing IQ-9075 EVK"
 
     # Profile only a subset of components:
     conda run -n qc python profile_pi05_mixed.py \
-        --checkpoint build/pi05_mixed_spin_actionw4 --use-spinquant-r1 \
+        --checkpoint build/pi05_mixed_spin_actionw4 \
         --components backbone action_expert
+
+SpinQuant rotations are folded into the checkpoint's weights, so there is no
+flag to set here -- the profile reflects whatever the checkpoint was built with.
 """
 
 from __future__ import annotations
@@ -68,8 +70,8 @@ def main() -> None:
         "--use-spinquant-r1",
         action="store_true",
         help=(
-            "Must match how the checkpoint's backbone was quantized "
-            "(see quantize.py --use-spinquant-r1)."
+            "Deprecated no-op. Rotations are folded into the checkpoint's "
+            "weights and detected from its markers."
         ),
     )
     parser.add_argument(
@@ -99,14 +101,18 @@ def main() -> None:
     device = hub.Device(args.device)
     target_runtime = TargetRuntime(args.target_runtime)
 
+    if args.use_spinquant_r1:
+        print(
+            "NOTE: --use-spinquant-r1 is a no-op; rotations come from the "
+            "checkpoint's markers."
+        )
     print(
         f"Loading quantized Pi05CollectionQuantized from checkpoint={args.checkpoint!r} "
-        f"on host_device={args.host_device!r} (use_spinquant_r1={args.use_spinquant_r1}) ..."
+        f"on host_device={args.host_device!r} ..."
     )
     model = Pi05CollectionQuantized.from_pretrained(
         checkpoint=args.checkpoint,
         host_device=torch.device(args.host_device),
-        use_spinquant_r1=args.use_spinquant_r1,
     )
 
     components = args.components or model.component_names

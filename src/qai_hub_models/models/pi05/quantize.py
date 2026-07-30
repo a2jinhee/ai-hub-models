@@ -13,7 +13,10 @@ Usage:
     python -m qai_hub_models.models.pi05.quantize --component backbone
     python -m qai_hub_models.models.pi05.quantize --component action_expert
 
-    # Rotate with SpinQuant (R1 + R2). Both rotated components must be built:
+    # Rotate with SpinQuant (R1 + R2). All three rotated components must be
+    # built into the same output directory:
+    python -m qai_hub_models.models.pi05.quantize --component vision_encoder \
+        --use-spinquant -o build/pi05_mixed_spin_r1r2
     python -m qai_hub_models.models.pi05.quantize --component backbone \
         --use-spinquant -o build/pi05_mixed_spin_r1r2
     python -m qai_hub_models.models.pi05.quantize --component action_expert \
@@ -23,19 +26,28 @@ Usage:
     python -m qai_hub_models.models.pi05.quantize --component backbone \
         --use-spinquant --no-seq-mse -o build/pi05_mixed_spin_r1r2_noseqmse
 
+    # Trade seqMSE runtime for accuracy (cost is linear in the sample count):
+    python -m qai_hub_models.models.pi05.quantize --component backbone \
+        --use-spinquant --seq-mse-num-samples 10 -o build/pi05_fast_seqmse
+
     # Override the default per-component precision (e.g. action_expert at w4a16):
     python -m qai_hub_models.models.pi05.quantize --component action_expert --precision w4a16
 
-If backbone is quantized with --use-spinquant, the deployment/eval path
-(Pi05App, e.g. pi05_libero_server.py) must also be run with R1 enabled, so
-hidden_state is rotated to match the backbone's rotated weights.
+--use-spinquant applies:
 
---use-spinquant applies R1 (residual stream) and R2 (per-head V/o_proj) to the
-backbone, and the matching R2 compensation to the action expert. R2 rotates the
-per-layer V caches the backbone hands the expert, so the two components are
-coupled and must be built together into the same checkpoint directory. Each
-records what it was built with in a marker file (SPINQUANT_MARKER), and the
-deployment path refuses a backbone/expert pair that disagree.
+  * R1 (residual stream) to the backbone, and to the two components that
+    produce its hidden_state -- the vision encoder's projector and the language
+    embedding table inside token_emb. R1 is folded into weights everywhere, so
+    the deployment path runs no rotation of its own and Pi05App needs no flag.
+  * R2 (per-head V/o_proj) to the backbone, and the matching compensation to
+    the action expert.
+
+Both rotations couple components: R1 links vision_encoder -> backbone, R2 links
+backbone -> action_expert. So all three must be built with the same setting into
+the same checkpoint directory. Each records what it was built with in a marker
+file (SPINQUANT_MARKER), and Pi05CollectionQuantized.from_pretrained refuses a
+set that disagrees. token_emb has no quantized artifact of its own; its R1 fold
+is re-derived at load time from the vision encoder's marker.
 """
 
 from __future__ import annotations
@@ -56,6 +68,7 @@ from qai_hub_models.models.pi05.model import (
 )
 from qai_hub_models.models.pi05.spinquant_r1 import write_rotation_marker
 from qai_hub_models.utils.dataset_util import dataset_entries_to_dataloader
+from qai_hub_models.utils.quantization_aimet_onnx import DEFAULT_SEQ_MSE_NUM_SAMPLES
 
 # Per-component precision mapping
 MIXED_PRECISION_MAP: dict[str, Precision] = {
@@ -105,6 +118,17 @@ def main() -> None:
         help="Number of samples used to calibrate.",
     )
     parser.add_argument(
+        "--seq-mse-num-samples",
+        type=int,
+        default=DEFAULT_SEQ_MSE_NUM_SAMPLES,
+        help=(
+            "Number of samples used for Sequential MSE weight-encoding "
+            "optimization. Kept separate from --num-samples because seqMSE "
+            "cost is linear in this count while activation calibration "
+            "benefits from more samples."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -142,21 +166,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rotated_components = ("backbone", "action_expert")
-    if args.use_spinquant and args.component not in rotated_components:
+    # R1 links vision_encoder -> backbone; R2 links backbone -> action_expert.
+    r1_components = ("vision_encoder", "backbone")
+    r2_components = ("backbone", "action_expert")
+    rotated_components = ("vision_encoder", "backbone", "action_expert")
+    if args.use_spinquant:
+        others = [c for c in rotated_components if c != args.component]
         print(
-            f"--use-spinquant has no effect on --component {args.component} "
-            f"(only {' and '.join(rotated_components)} are rotated); ignoring."
-        )
-    elif args.use_spinquant:
-        other = next(c for c in rotated_components if c != args.component)
-        print(
-            f"\n  NOTE: R2 couples backbone and action_expert. Build '{other}' "
-            f"with --use-spinquant\n  into the same checkpoint directory, or "
-            "the pair will be refused at load time.\n"
+            f"\n  NOTE: SpinQuant couples all of {', '.join(rotated_components)}.\n"
+            f"  Build {' and '.join(repr(c) for c in others)} with --use-spinquant\n"
+            "  into the same checkpoint directory, or the set will be refused at "
+            "load time.\n"
         )
 
     torch.manual_seed(args.seed)
+
+    # Resolve and validate the output directory up front. save_calibrated_checkpoint
+    # runs only after calibration, so an unwritable path (a typo, or an unset shell
+    # variable collapsing "$OUT/name" to "/name") would otherwise surface hours in
+    # and discard the whole run.
+    output_dir = Path(args.output or Path() / "build" / f"{MODEL_ID}_mixed").resolve()
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        probe = output_dir / ".write_probe"
+        probe.touch()
+        probe.unlink()
+    except OSError as err:
+        raise SystemExit(
+            f"Output directory '{output_dir}' is not writable: {err}\n"
+            "Check -o / --output (a leading '/' usually means a shell variable "
+            "was empty)."
+        ) from err
+    print(f"Output directory: {output_dir}")
 
     host_device = torch.device(args.host_device)
 
@@ -177,10 +218,9 @@ def main() -> None:
     print(f"Quantizing component={args.component} precision={precision}")
 
     from_pretrained_kwargs: dict = {}
-    if args.component == "backbone":
+    if args.component in r1_components:
         from_pretrained_kwargs["use_spinquant_r1"] = args.use_spinquant
-        from_pretrained_kwargs["use_spinquant_r2"] = args.use_spinquant
-    elif args.component == "action_expert":
+    if args.component in r2_components:
         from_pretrained_kwargs["use_spinquant_r2"] = args.use_spinquant
 
     component = QCls.from_pretrained(
@@ -211,21 +251,20 @@ def main() -> None:
         data_loader,
         num_samples=args.num_samples,
         use_seq_mse=args.use_seq_mse,
+        seq_mse_num_samples=args.seq_mse_num_samples,
     )
 
-    output_dir = args.output or str(Path() / "build" / f"{MODEL_ID}_mixed")
-    component.save_calibrated_checkpoint(output_checkpoint=output_dir)
+    component.save_calibrated_checkpoint(output_checkpoint=str(output_dir))
 
-    if args.component in rotated_components:
-        # save_calibrated_checkpoint writes into <output_dir>/<subfolder>, so
-        # the marker belongs beside the component it describes -- that is where
-        # Pi05CollectionQuantized.from_pretrained looks for it.
-        marker = write_rotation_marker(
-            Path(output_dir) / QCls.default_subfolder,
-            r1=args.use_spinquant and args.component == "backbone",
-            r2=args.use_spinquant,
-        )
-        print(f"Recorded SpinQuant rotations in {marker}")
+    # save_calibrated_checkpoint writes into <output_dir>/<subfolder>, so the
+    # marker belongs beside the component it describes -- that is where
+    # Pi05CollectionQuantized.from_pretrained looks for it.
+    marker = write_rotation_marker(
+        Path(output_dir) / QCls.default_subfolder,
+        r1=args.use_spinquant and args.component in r1_components,
+        r2=args.use_spinquant and args.component in r2_components,
+    )
+    print(f"Recorded SpinQuant rotations in {marker}")
 
 
 if __name__ == "__main__":

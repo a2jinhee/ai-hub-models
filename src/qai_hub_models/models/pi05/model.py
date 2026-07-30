@@ -45,7 +45,9 @@ from qai_hub_models.models.pi05.model_adaptation import (
 from qai_hub_models.models.pi05.spinquant_r1 import (
     apply_action_expert_r2,
     apply_backbone_rotations,
+    apply_vision_r1,
     read_rotation_marker,
+    rotate_embedding_weight,
 )
 from qai_hub_models.utils.aimet.aimet_dummy_model import zip_aimet_model
 from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
@@ -87,6 +89,10 @@ NUM_ACTION_STEPS = 50
 # Set NUM_CAMERAS to override the value in policy (e.g., for profiling
 # purpose).
 NUM_CAMERAS = 3
+# PaliGemma (Gemma-2B) residual stream width. The vision encoder's projector
+# and the language embedding table both write into it, so SpinQuant R1 acts on
+# this axis. Asserted against the exported graphs when R1 is folded in.
+BACKBONE_HIDDEN_SIZE = 2048
 
 DEFAULT_CHECKPOINT = "lerobot/pi05_libero_finetuned"
 
@@ -337,11 +343,13 @@ class Pi05PaliGemmaVisionQuantizable(
         host_device: torch.device = torch.device("cpu"),
         onnx_bundle: ONNXBundle | None = None,
         precision: Precision = Precision.w8a16,
+        use_spinquant_r1: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
         self.host_device = host_device
         self._precision = precision
+        self._use_spinquant_r1 = use_spinquant_r1
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -350,6 +358,13 @@ class Pi05PaliGemmaVisionQuantizable(
 
         onnx_model = self._onnx_bundle.load_onnx_model()
         onnx_model, _ = simplify(onnx_model, skipped_optimizers=["fuse_qkv"])
+
+        if self._use_spinquant_r1:
+            # Fold R1 into the multi_modal projector so img_embed lands in the
+            # rotated residual stream the backbone expects. Runs after simplify
+            # (so the graph is final) and before QuantSimOnnx, so the output
+            # activation quantizer is calibrated on rotated values.
+            apply_vision_r1(onnx_model, hidden_size=BACKBONE_HIDDEN_SIZE)
 
         return QuantSimOnnx(
             model=onnx_model,
@@ -380,6 +395,7 @@ class Pi05PaliGemmaVisionQuantizable(
         precision: Precision = Precision.w8a16,
         torch_from_pretrained_kwargs: dict[str, Any] | None = None,
         cls_kwargs: dict[str, Any] | None = None,
+        use_spinquant_r1: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         subfolder = subfolder or cls.default_subfolder
@@ -390,7 +406,11 @@ class Pi05PaliGemmaVisionQuantizable(
             torch_to_onnx_options={"opset_version": 20},
         )
         return cls(
-            None, host_device=host_device, onnx_bundle=bundle, precision=precision
+            None,
+            host_device=host_device,
+            onnx_bundle=bundle,
+            precision=precision,
+            use_spinquant_r1=use_spinquant_r1,
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
@@ -431,11 +451,30 @@ class Pi05PaliGemmaTokenEmbed(LoadPolicyMixin, BaseModel):
     def component_precision(self) -> Precision:
         return Precision.float
 
-    def __init__(self, model: PI05Policy) -> None:
+    def __init__(self, model: PI05Policy, use_spinquant_r1: bool = False) -> None:
         assert isinstance(model, PI05Policy)
         flow_model: PI05Pytorch = model.model.to(torch.float32)
         assert flow_model.config.tokenizer_max_length == MAX_TOKEN_LENGTH
         super().__init__(flow_model)
+
+        # SpinQuant R1 folded into the language embedding table, so the lookup
+        # emits rows already in the backbone's rotated residual stream and no
+        # extra op enters the exported graph. Held as a buffer rather than
+        # written back into the nn.Embedding, which belongs to the lru_cache'd
+        # policy shared with the unrotated float components. See spinquant_r1.py.
+        self._use_spinquant_r1 = use_spinquant_r1
+        if use_spinquant_r1:
+            embed_weight = flow_model.paligemma_with_expert.paligemma.language_model.embed_tokens.weight
+            if embed_weight.shape[-1] != BACKBONE_HIDDEN_SIZE:
+                raise ValueError(
+                    f"Embedding table has hidden size {embed_weight.shape[-1]}, "
+                    f"expected {BACKBONE_HIDDEN_SIZE}; R1 would rotate the wrong axis."
+                )
+            self.register_buffer(
+                "r1_embed_weight",
+                rotate_embedding_weight(embed_weight),
+                persistent=False,
+            )
 
         # RoPE setup. Keep in sync with model head dim (256).
         head_dim = (
@@ -500,7 +539,12 @@ class Pi05PaliGemmaTokenEmbed(LoadPolicyMixin, BaseModel):
         # Language embedding + normalization.
         paligemma = self.model.paligemma_with_expert
         assert isinstance(paligemma, PaliGemmaWithExpertModel)
-        lang_emb = paligemma.embed_language_tokens(lang_tokens)
+        if self._use_spinquant_r1:
+            # Same lookup, against the R1-rotated table. The sqrt(D) normalizer
+            # below is a scalar, so it commutes with the rotation.
+            lang_emb = torch.nn.functional.embedding(lang_tokens, self.r1_embed_weight)
+        else:
+            lang_emb = paligemma.embed_language_tokens(lang_tokens)
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
@@ -1973,14 +2017,27 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
         cls,
         checkpoint: str = "DEFAULT",
         host_device: torch.device | str = torch.device("cpu"),
-        use_spinquant_r1: bool = False,
     ) -> Pi05CollectionQuantized:
-        # R2 couples the two components: the backbone exports V caches rotated
+        """
+        Load a calibrated checkpoint.
+
+        Rotations are never (re-)applied here. A checkpoint written by
+        quantize.py already has them baked into its saved weights, so the
+        markers are read only to validate that the components agree -- passing
+        a use_spinquant flag at load time would rotate a second time. The one
+        exception is token_emb, which has no quantized artifact of its own and
+        is rebuilt from the float checkpoint, so its R1 fold is re-derived from
+        the vision encoder's marker.
+        """
+        root = Path(str(checkpoint))
+        vision_ckpt = root / Pi05PaliGemmaVisionQuantizable.default_subfolder
+        backbone_ckpt = root / Pi05PaliGemmaBackboneQuantizable.default_subfolder
+        expert_ckpt = root / Pi05ActionExpertQuantizable.default_subfolder
+
+        # R2 couples backbone and expert: the backbone exports V caches rotated
         # by R2 and the expert's o_proj absorbs the inverse. Mixing an R2
         # component with a non-R2 one runs without error but yields wrong
         # actions, so refuse the mismatch here. See spinquant_r1.py.
-        root = Path(str(checkpoint))
-        backbone_ckpt, expert_ckpt = root / "backbone", root / "action_expert"
         if backbone_ckpt.is_dir() and expert_ckpt.is_dir():
             backbone_r2 = read_rotation_marker(backbone_ckpt)["r2"]
             expert_r2 = read_rotation_marker(expert_ckpt)["r2"]
@@ -1991,19 +2048,35 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
                     "the backbone hands the expert, so both components must be "
                     "built with the same setting."
                 )
+
+        # R1 couples the producers of hidden_state (vision projector, embedding
+        # table) with the backbone that consumes it. Same failure mode.
+        embed_r1 = False
+        if vision_ckpt.is_dir() and backbone_ckpt.is_dir():
+            vision_r1 = read_rotation_marker(vision_ckpt)["r1"]
+            backbone_r1 = read_rotation_marker(backbone_ckpt)["r1"]
+            if vision_r1 != backbone_r1:
+                raise ValueError(
+                    f"SpinQuant R1 mismatch in '{root}': vision_encoder "
+                    f"r1={vision_r1} but backbone r1={backbone_r1}. R1 rotates "
+                    "the hidden_state the vision encoder and token embedder "
+                    "produce, so all three must be built with the same setting."
+                )
+            embed_r1 = backbone_r1
+
         return cls(
             Pi05PaliGemmaVisionQuantizable.from_pretrained(
                 checkpoint=checkpoint, host_device=host_device
             ),
             Pi05PaliGemmaTokenEmbed.from_pretrained(
-                checkpoint=checkpoint, host_device=host_device
+                checkpoint=checkpoint,
+                host_device=host_device,
+                cls_kwargs={"use_spinquant_r1": embed_r1},
             ),
             Pi05ActionExpertQuantizable.from_pretrained(
                 checkpoint=checkpoint, host_device=host_device
             ),
             Pi05PaliGemmaBackboneQuantizable.from_pretrained(
-                checkpoint=checkpoint,
-                host_device=host_device,
-                use_spinquant_r1=use_spinquant_r1,
+                checkpoint=checkpoint, host_device=host_device
             ),
         )
