@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
@@ -43,6 +44,7 @@ from qai_hub_models.models.pi05.model_adaptation import (
     apply_rope_direct,
 )
 from qai_hub_models.models.pi05.spinquant_r1 import (
+    apply_action_expert_r1,
     apply_action_expert_r2,
     apply_backbone_rotations,
     apply_vision_r1,
@@ -52,6 +54,7 @@ from qai_hub_models.models.pi05.spinquant_r1 import (
 from qai_hub_models.utils.aimet.aimet_dummy_model import zip_aimet_model
 from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
 from qai_hub_models.utils.aimet.encodings import apply_propagate_memory_encodings
+from qai_hub_models.utils.asset_loaders import LOCAL_STORE_DEFAULT_PATH
 from qai_hub_models.utils.base_collection_model import WorkbenchModelCollection
 from qai_hub_models.utils.base_dataset import BaseDataset
 from qai_hub_models.utils.base_model import BaseModel
@@ -70,7 +73,11 @@ from qai_hub_models.utils.input_spec import (
     TensorSpec,
     make_torch_inputs,
 )
-from qai_hub_models.utils.onnx.helpers import ONNXBundle, mock_torch_onnx_inference
+from qai_hub_models.utils.onnx.helpers import (
+    ONNXBundle,
+    mock_torch_onnx_inference,
+    safe_torch_onnx_export,
+)
 from qai_hub_models.utils.qai_hub_helpers import (
     ensure_hexagon_version,
     export_torch_to_onnx_zip,
@@ -1731,9 +1738,80 @@ class Pi05ActionExpertQuantizable(
         subfolder: str = "",
         host_device: torch.device | str = torch.device("cpu"),
         adapt_torch_model_options: dict | None = None,
+        use_spinquant_r1: bool = False,
     ) -> torch.nn.Module:
         policy = load_checkpoint(str(checkpoint))
-        return Pi05ActionExpert(policy).to(host_device).eval()
+        expert = Pi05ActionExpert(policy).to(host_device).eval()
+        if use_spinquant_r1:
+            apply_action_expert_r1(expert, NUM_ACTION_STEPS)
+        return expert
+
+    @classmethod
+    def onnx_from_pretrained(  # type: ignore[override]
+        cls,
+        checkpoint: CheckpointSpec = "DEFAULT",
+        subfolder: str = "",
+        host_device: torch.device | str = torch.device("cpu"),
+        torch_to_onnx_options: dict | None = None,
+        use_spinquant_r1: bool = False,
+    ) -> ONNXBundle:
+        """
+        Same as the base FromPretrainedMixin.onnx_from_pretrained, except it
+        threads use_spinquant_r1 through to torch_from_pretrained. The base
+        implementation doesn't forward extra kwargs to torch_from_pretrained,
+        but the R1 fold must happen on the PyTorch module *before* export
+        (unlike R2, which rotates the already-exported ONNX model in
+        make_quant_sim): AdaRMS's per-channel scale/shift/gate is a genuine
+        runtime computation, so the localized online-rotation wrapper
+        apply_action_expert_r1 installs must be part of the traced graph, not
+        inserted into it afterward. See spinquant_r1.py.
+        """
+        subfolder_hf = subfolder or cls.default_subfolder_hf
+        subfolder_local = subfolder or cls.default_subfolder
+        host_device = torch.device(host_device)
+        ckpt_type = CheckpointType.from_checkpoint(
+            checkpoint, subfolder=subfolder_local
+        )
+
+        is_quantized_src = ckpt_type in (
+            CheckpointType.DEFAULT,
+            CheckpointType.AIMET_ONNX_EXPORT,
+        )
+        if is_quantized_src:
+            if ckpt_type == CheckpointType.DEFAULT:
+                onnx_path, _ = cls.get_calibrated_aimet_model()
+                return ONNXBundle.from_bundle_path(Path(onnx_path).parent)
+            subfolder_path = Path(checkpoint) / subfolder_local
+            return ONNXBundle.from_bundle_path(subfolder_path)
+
+        cp = checkpoint
+        if ckpt_type == CheckpointType.DEFAULT_UNQUANTIZED:
+            cp = "DEFAULT"
+        fp_model = cls.torch_from_pretrained(
+            checkpoint=cp,
+            subfolder=subfolder_hf,
+            host_device=host_device,
+            use_spinquant_r1=use_spinquant_r1,
+        )
+        fp_model_typed = cast(Pi05ActionExpert, fp_model)
+        input_spec = fp_model_typed.get_input_spec()
+
+        example_input = tuple(make_torch_inputs(input_spec))
+        example_input = tuple(t.to(host_device) for t in example_input)
+
+        torch_to_onnx_options = torch_to_onnx_options or {}
+        tmp_base = Path(LOCAL_STORE_DEFAULT_PATH) / "tmp"
+        tmp_base.mkdir(parents=True, exist_ok=True)
+        tmpdir = tempfile.mkdtemp(dir=tmp_base)
+        safe_torch_onnx_export(
+            fp_model,
+            example_input,
+            os.path.join(tmpdir, "model.onnx"),
+            input_names=list(input_spec.keys()),
+            output_names=list(fp_model_typed.get_output_spec()),
+            **torch_to_onnx_options,
+        )
+        return ONNXBundle.from_bundle_path(tmpdir, ephemeral=True)
 
     @classmethod
     def from_pretrained(  # type: ignore[override]
@@ -1745,6 +1823,7 @@ class Pi05ActionExpertQuantizable(
         torch_from_pretrained_kwargs: dict[str, Any] | None = None,
         cls_kwargs: dict[str, Any] | None = None,
         use_spinquant_r2: bool = False,
+        use_spinquant_r1: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         ckpt_type = CheckpointType.from_checkpoint(checkpoint, subfolder="")
@@ -1757,6 +1836,7 @@ class Pi05ActionExpertQuantizable(
                 subfolder=subfolder,
                 host_device=host_device,
                 torch_to_onnx_options={"opset_version": 20},
+                use_spinquant_r1=use_spinquant_r1,
             )
         return cls(
             None,

@@ -22,13 +22,14 @@ Usage:
     python -m qai_hub_models.models.pi05.quantize --component action_expert \
         --use-spinquant -o build/pi05_mixed_spin_r1r2
 
-    # Rotations only, no seqMSE (isolates the rotations' contribution):
+    # Rotations only (seqMSE is off by default -- isolates the rotations'
+    # contribution):
     python -m qai_hub_models.models.pi05.quantize --component backbone \
-        --use-spinquant --no-seq-mse -o build/pi05_mixed_spin_r1r2_noseqmse
+        --use-spinquant -o build/pi05_mixed_spin_r1r2_noseqmse
 
-    # Trade seqMSE runtime for accuracy (cost is linear in the sample count):
+    # Add seqMSE on top of rotations (cost is linear in the sample count):
     python -m qai_hub_models.models.pi05.quantize --component backbone \
-        --use-spinquant --seq-mse-num-samples 10 -o build/pi05_fast_seqmse
+        --use-spinquant --use-seq-mse --seq-mse-num-samples 10 -o build/pi05_fast_seqmse
 
     # Override the default per-component precision (e.g. action_expert at w4a16):
     python -m qai_hub_models.models.pi05.quantize --component action_expert --precision w4a16
@@ -39,15 +40,24 @@ Usage:
     produce its hidden_state -- the vision encoder's projector and the language
     embedding table inside token_emb. R1 is folded into weights everywhere, so
     the deployment path runs no rotation of its own and Pi05App needs no flag.
+  * R1 to the action expert's own residual stream, independently of the
+    backbone's R1 -- self-contained, no cross-component coupling. Most of it
+    is a zero-cost static fold; a small, localized online rotation is paid
+    only around the three AdaRMS norm calls per layer, since AdaRMS's
+    scale/shift/gate is a genuine runtime computation. See
+    apply_action_expert_r1 in spinquant_r1.py.
   * R2 (per-head V/o_proj) to the backbone, and the matching compensation to
     the action expert.
 
-Both rotations couple components: R1 links vision_encoder -> backbone, R2 links
-backbone -> action_expert. So all three must be built with the same setting into
-the same checkpoint directory. Each records what it was built with in a marker
-file (SPINQUANT_MARKER), and Pi05CollectionQuantized.from_pretrained refuses a
-set that disagrees. token_emb has no quantized artifact of its own; its R1 fold
-is re-derived at load time from the vision encoder's marker.
+R1 on vision_encoder/backbone and R2 on backbone/action_expert couple those
+components: R1 links vision_encoder -> backbone, R2 links backbone ->
+action_expert. So all three must be built with the same setting into the same
+checkpoint directory. Each records what it was built with in a marker file
+(SPINQUANT_MARKER), and Pi05CollectionQuantized.from_pretrained refuses a set
+that disagrees. token_emb has no quantized artifact of its own; its R1 fold is
+re-derived at load time from the vision encoder's marker. action_expert's own
+R1 has no such coupling -- it's recorded in the same marker file alongside its
+R2 flag, but only for record-keeping, not cross-component validation.
 """
 
 from __future__ import annotations
@@ -148,26 +158,30 @@ def main() -> None:
         help=(
             "Apply SpinQuant rotations (R1 + R2) before calibration. On the "
             "backbone this rotates the residual stream (R1) and the per-head "
-            "V/o_proj path (R2); on the action expert it applies the matching "
-            "R2 compensation. No effect on --component vision_encoder. "
-            "Because R2 couples them, the backbone and action_expert must both "
-            "be built with this flag. See spinquant_r1.py."
+            "V/o_proj path (R2); on the action expert it applies its own "
+            "independent residual-stream R1 plus the matching R2 compensation "
+            "for the backbone's R2. No effect on --component vision_encoder. "
+            "Because R2 couples backbone and action_expert, both must be "
+            "built with this flag together. See spinquant_r1.py."
         ),
     )
     parser.add_argument(
-        "--no-seq-mse",
+        "--use-seq-mse",
         dest="use_seq_mse",
-        action="store_false",
+        action="store_true",
         help=(
-            "Skip Sequential MSE weight-encoding optimization, leaving plain "
-            "min-max encodings. Useful for isolating the effect of the "
-            "SpinQuant rotations from that of seqMSE."
+            "Apply Sequential MSE weight-encoding optimization instead of "
+            "plain min-max encodings. Off by default so the effect of "
+            "SpinQuant rotations can be checked in isolation from seqMSE's."
         ),
     )
     args = parser.parse_args()
 
-    # R1 links vision_encoder -> backbone; R2 links backbone -> action_expert.
-    r1_components = ("vision_encoder", "backbone")
+    # R1 links vision_encoder -> backbone (shared rotation); on action_expert
+    # it's an independent, self-contained rotation with no cross-component
+    # coupling (see apply_action_expert_r1 in spinquant_r1.py). R2 links
+    # backbone -> action_expert.
+    r1_components = ("vision_encoder", "backbone", "action_expert")
     r2_components = ("backbone", "action_expert")
     rotated_components = ("vision_encoder", "backbone", "action_expert")
     if args.use_spinquant:
