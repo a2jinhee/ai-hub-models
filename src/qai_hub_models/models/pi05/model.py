@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import tempfile
@@ -17,6 +18,7 @@ import onnxruntime
 import torch
 from aimet_onnx.common.defs import QuantScheme
 from aimet_onnx.quantsim import QuantizationSimModel as QuantSimOnnx
+from aimet_onnx.quantsim import load_encodings_to_sim
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import (
     PaliGemmaWithExpertModel,
@@ -90,6 +92,87 @@ from qai_hub_models.utils.quantization_aimet_onnx import (
 MODEL_ID = __name__.split(".")[-2]
 MODEL_ASSET_VERSION = 2
 _PI05_AIMET_CONFIG = str(Path(__file__).parent / "aimet_config.json")
+
+
+def _drop_unloadable_encodings(quant_sim: QuantSimOnnx, encodings: dict) -> set[str]:
+    """Remove encodings AIMET's own loader would reject, mutating ``encodings``.
+
+    Mirrors ``aimet_onnx.quantsim._validate_encodings_to_load``: an entry whose
+    tensor has no quantizer yet must both exist in the connected graph and have a
+    quantizable dtype, or the load raises (``strict=False`` does not cover this).
+    Entries that merely lack a quantizer are kept -- AIMET creates one for those.
+
+    Returns the set of dropped names.
+    """
+    products = quant_sim.connected_graph.get_all_products()
+
+    def unloadable(name: str) -> bool:
+        if name in quant_sim.qc_quantize_op_dict:
+            return False
+        return name not in products or not quant_sim._is_quantizable_dtype(name)
+
+    dropped: set[str] = set()
+    for key in ("param_encodings", "activation_encodings"):
+        section = encodings.get(key)
+        if isinstance(section, list):  # encodings version 1.0.0 / 2.0.0
+            kept = [e for e in section if not unloadable(e.get("name", ""))]
+            dropped |= {e.get("name", "") for e in section} - {
+                e.get("name", "") for e in kept
+            }
+            encodings[key] = kept
+        elif isinstance(section, dict):  # encodings version 0.6.1
+            bad = {n for n in section if unloadable(n)}
+            for n in bad:
+                del section[n]
+            dropped |= bad
+    return dropped
+
+
+def _load_bundle_encodings(quant_sim: QuantSimOnnx, bundle: ONNXBundle) -> None:
+    """Load a calibrated checkpoint's encodings into a freshly built QuantSim.
+
+    Without this the sim keeps its constructor defaults: activation quantizers
+    sit in ``updateStats`` (they pass tensors through unquantized) and weight
+    quantizers recompute plain min-max on every run, discarding whatever
+    seqMSE/AdaScale produced during calibration. Only the export path reads the
+    encodings file; the local run path needs this.
+
+    Must be called *after* any bitwidth overrides (``_set_matmul_second_input_to_8b``,
+    ``_set_tensors_to_output_8b_sym``) -- ``strict=False`` silently skips an
+    encoding whose bitwidth disagrees with its quantizer.
+    """
+    if bundle.aimet_encodings_path is None:
+        # Uncalibrated source (DEFAULT_UNQUANTIZED / fresh torch export). The
+        # sim is about to be calibrated by quantize.py, so there is nothing to load.
+        return
+
+    with open(bundle.aimet_encodings_path) as f:
+        encodings = json.load(f)
+
+    dropped = _drop_unloadable_encodings(quant_sim, encodings)
+    if dropped:
+        # apply_propagate_memory_encodings writes entries for memory ops so the
+        # HTP path carries encodings through Transpose/Reshape/Cast. Some land on
+        # tensors QuantSim itself refuses (e.g. a Cast to an integer dtype), and
+        # load_encodings_to_sim raises on those regardless of strict=False.
+        # They carry no meaning in simulation, so drop them here rather than on disk.
+        print(
+            f"Dropping {len(dropped)} non-quantizable encoding(s) before load: "
+            f"{sorted(dropped)[:5]}{' ...' if len(dropped) > 5 else ''}"
+        )
+
+    load_encodings_to_sim(quant_sim, encodings, strict=False)
+
+    loaded = sum(1 for q in quant_sim.qc_quantize_op_dict.values() if q.get_encodings())
+    enabled = sum(1 for q in quant_sim.qc_quantize_op_dict.values() if q.enabled)
+    if loaded < enabled:
+        # strict=False turns a name/bitwidth mismatch into a silently skipped
+        # quantizer, which reads as "quantized" but runs partly in float.
+        print(
+            f"WARNING: loaded encodings for {loaded}/{enabled} enabled quantizers "
+            f"from {bundle.aimet_encodings_path}. The remainder will run unquantized."
+        )
+
 
 MAX_TOKEN_LENGTH = 200  # 48 for pi0, 200 for pi05
 NUM_ACTION_STEPS = 50
@@ -373,7 +456,7 @@ class Pi05PaliGemmaVisionQuantizable(
             # activation quantizer is calibrated on rotated values.
             apply_vision_r1(onnx_model, hidden_size=BACKBONE_HIDDEN_SIZE)
 
-        return QuantSimOnnx(
+        quant_sim = QuantSimOnnx(
             model=onnx_model,
             quant_scheme=QuantScheme.min_max,
             param_type=param_type,
@@ -381,6 +464,8 @@ class Pi05PaliGemmaVisionQuantizable(
             config_file=get_aimet_config_path("default_config"),
             providers=AIMETOnnxQuantizableMixin.get_ort_providers(self.host_device),
         )
+        _load_bundle_encodings(quant_sim, self._onnx_bundle)
+        return quant_sim
 
     @classmethod
     def torch_from_pretrained(
@@ -1616,6 +1701,8 @@ class Pi05PaliGemmaBackboneQuantizable(
             providers=AIMETOnnxQuantizableMixin.get_ort_providers(self.host_device),
         )
         _set_matmul_second_input_to_8b(quant_sim)
+        # After the bitwidth overrides above -- see _load_bundle_encodings.
+        _load_bundle_encodings(quant_sim, self._onnx_bundle)
         return quant_sim
 
     @classmethod
@@ -1729,6 +1816,8 @@ class Pi05ActionExpertQuantizable(
         ]
         _set_tensors_to_output_8b_sym(quant_sim, kv_inputs)
         _set_matmul_second_input_to_8b(quant_sim)
+        # After the bitwidth overrides above -- see _load_bundle_encodings.
+        _load_bundle_encodings(quant_sim, self._onnx_bundle)
         return quant_sim
 
     @classmethod
