@@ -27,6 +27,7 @@ from qai_hub_models.models.pi05.model import (
 from qai_hub_models.models.pi05.spinquant_r1 import (
     get_r1_matrix,
     get_r2_matrix,
+    get_r3_matrix,
     rotate_activation,
 )
 from qai_hub_models.protocols import ExecutableModelProtocol
@@ -536,6 +537,7 @@ class Pi05App(torch.nn.Module):
         num_samples: int | None = None,
         use_spinquant_r1: bool = False,
         use_spinquant_r2: bool = False,
+        use_spinquant_r3: bool = False,
     ) -> DatasetEntries:
         """
         Build calibration data starting from the LIBERO dataset.
@@ -575,6 +577,13 @@ class Pi05App(torch.nn.Module):
         driving the Euler loop is still run on the unrotated caches, so x_t
         follows the true trajectory -- R2 is exactly cancelling, so the rotated
         and unrotated pipelines produce the same actions.
+
+        use_spinquant_r3 is the same pattern as use_spinquant_r2, but for K:
+        an R3 backbone exports K caches rotated per head (see
+        _rotate_backbone_r3), so the recorded key_cache_l* calibration tensors
+        are rotated to match. Like R2, kv_kwargs driving the float expert's
+        Euler loop stays unrotated -- R3 is exactly cancelling inside the
+        expert's own QK^T, so it doesn't change the true x_t trajectory.
         """
         if component_name == "token_emb":
             raise NotImplementedError("token_emb is not quantized")
@@ -722,6 +731,14 @@ class Pi05App(torch.nn.Module):
                 else:
                     v_caches_recorded = v_caches
 
+                # Same pattern for R3's rotated K caches -- see the R2 comment
+                # above; kv_kwargs (unrotated) still drives the float expert.
+                if use_spinquant_r3:
+                    R3 = get_r3_matrix(k_caches[0].shape[-1])
+                    k_caches_recorded = [rotate_activation(k, R3) for k in k_caches]
+                else:
+                    k_caches_recorded = k_caches
+
                 x_t = torch.randn(1, NUM_ACTION_STEPS, state_dim, device=device)
                 dt = -1.0 / float(num_steps)
                 t_cur = 1.0
@@ -732,7 +749,7 @@ class Pi05App(torch.nn.Module):
                     tensors_per_input[3].append(x_t.clone())
                     tensors_per_input[4].append(torch.tensor([t_cur], device=device))
                     for i in range(18):
-                        tensors_per_input[5 + i].append(k_caches[i])
+                        tensors_per_input[5 + i].append(k_caches_recorded[i])
                         tensors_per_input[23 + i].append(v_caches_recorded[i])
 
                     v_t = action_expert._compute_update(

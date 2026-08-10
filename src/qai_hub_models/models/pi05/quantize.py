@@ -13,19 +13,19 @@ Usage:
     python -m qai_hub_models.models.pi05.quantize --component backbone
     python -m qai_hub_models.models.pi05.quantize --component action_expert
 
-    # Rotate with SpinQuant (R1 + R2). All three rotated components must be
-    # built into the same output directory:
+    # Rotate with SpinQuant (R1 + R2 + R3 + R4, wherever each applies). All
+    # three rotated components must be built into the same output directory:
     python -m qai_hub_models.models.pi05.quantize --component vision_encoder \
-        --use-spinquant -o build/pi05_mixed_spin_r1r2
+        --use-spinquant -o build/pi05_mixed_spin_r1r2r3r4
     python -m qai_hub_models.models.pi05.quantize --component backbone \
-        --use-spinquant -o build/pi05_mixed_spin_r1r2
+        --use-spinquant -o build/pi05_mixed_spin_r1r2r3r4
     python -m qai_hub_models.models.pi05.quantize --component action_expert \
-        --use-spinquant -o build/pi05_mixed_spin_r1r2
+        --use-spinquant -o build/pi05_mixed_spin_r1r2r3r4
 
     # Rotations only (seqMSE is off by default -- isolates the rotations'
     # contribution):
     python -m qai_hub_models.models.pi05.quantize --component backbone \
-        --use-spinquant -o build/pi05_mixed_spin_r1r2_noseqmse
+        --use-spinquant -o build/pi05_mixed_spin_noseqmse
 
     # Add seqMSE on top of rotations (cost is linear in the sample count):
     python -m qai_hub_models.models.pi05.quantize --component backbone \
@@ -48,16 +48,22 @@ Usage:
     apply_action_expert_r1 in spinquant_r1.py.
   * R2 (per-head V/o_proj) to the backbone, and the matching compensation to
     the action expert.
+  * R3 (per-head Q/K, online rotation) to the backbone, and the matching
+    compensation to the action expert. No effect on vision_encoder.
+  * R4 (FFN down_proj input) to the backbone only -- self-contained, no
+    action-expert coupling (not applied there; too slow currently). Recorded
+    in the marker for record-keeping only, like action_expert's own R1.
 
-R1 on vision_encoder/backbone and R2 on backbone/action_expert couple those
-components: R1 links vision_encoder -> backbone, R2 links backbone ->
-action_expert. So all three must be built with the same setting into the same
-checkpoint directory. Each records what it was built with in a marker file
-(SPINQUANT_MARKER), and Pi05CollectionQuantized.from_pretrained refuses a set
-that disagrees. token_emb has no quantized artifact of its own; its R1 fold is
-re-derived at load time from the vision encoder's marker. action_expert's own
-R1 has no such coupling -- it's recorded in the same marker file alongside its
-R2 flag, but only for record-keeping, not cross-component validation.
+R1 on vision_encoder/backbone and R2/R3 on backbone/action_expert couple those
+components: R1 links vision_encoder -> backbone, R2 and R3 each independently
+link backbone -> action_expert. So all rotated components must be built with
+matching settings into the same checkpoint directory. Each records what it was
+built with in a marker file (SPINQUANT_MARKER), and
+Pi05CollectionQuantized.from_pretrained refuses a set that disagrees. token_emb
+has no quantized artifact of its own; its R1 fold is re-derived at load time
+from the vision encoder's marker. action_expert's own R1 has no such coupling
+-- it's recorded in the same marker file alongside its R2/R3 flags, but only
+for record-keeping, not cross-component validation.
 """
 
 from __future__ import annotations
@@ -156,13 +162,16 @@ def main() -> None:
         dest="use_spinquant",
         action="store_true",
         help=(
-            "Apply SpinQuant rotations (R1 + R2) before calibration. On the "
-            "backbone this rotates the residual stream (R1) and the per-head "
-            "V/o_proj path (R2); on the action expert it applies its own "
-            "independent residual-stream R1 plus the matching R2 compensation "
-            "for the backbone's R2. No effect on --component vision_encoder. "
-            "Because R2 couples backbone and action_expert, both must be "
-            "built with this flag together. See spinquant_r1.py."
+            "Apply SpinQuant rotations (R1 + R2 + R3 + R4, wherever each "
+            "applies) before calibration. On the backbone this rotates the "
+            "residual stream (R1), the per-head V/o_proj path (R2), the "
+            "per-head Q/K path (R3), and the FFN down_proj input (R4); on "
+            "the action expert it applies its own independent "
+            "residual-stream R1 plus the matching R2/R3 compensation for "
+            "the backbone's R2/R3 (R4 is backbone-only). No effect on "
+            "--component vision_encoder beyond R1. Because R2/R3 couple "
+            "backbone and action_expert, both must be built with this flag "
+            "together. See spinquant_r1.py."
         ),
     )
     parser.add_argument(
@@ -179,10 +188,13 @@ def main() -> None:
 
     # R1 links vision_encoder -> backbone (shared rotation); on action_expert
     # it's an independent, self-contained rotation with no cross-component
-    # coupling (see apply_action_expert_r1 in spinquant_r1.py). R2 links
-    # backbone -> action_expert.
+    # coupling (see apply_action_expert_r1 in spinquant_r1.py). R2 and R3
+    # each independently link backbone -> action_expert. R4 is backbone-only,
+    # self-contained -- no action-expert counterpart.
     r1_components = ("vision_encoder", "backbone", "action_expert")
     r2_components = ("backbone", "action_expert")
+    r3_components = ("backbone", "action_expert")
+    r4_components = ("backbone",)
     rotated_components = ("vision_encoder", "backbone", "action_expert")
     if args.use_spinquant:
         others = [c for c in rotated_components if c != args.component]
@@ -236,6 +248,10 @@ def main() -> None:
         from_pretrained_kwargs["use_spinquant_r1"] = args.use_spinquant
     if args.component in r2_components:
         from_pretrained_kwargs["use_spinquant_r2"] = args.use_spinquant
+    if args.component in r3_components:
+        from_pretrained_kwargs["use_spinquant_r3"] = args.use_spinquant
+    if args.component in r4_components:
+        from_pretrained_kwargs["use_spinquant_r4"] = args.use_spinquant
 
     component = QCls.from_pretrained(
         checkpoint=args.checkpoint,
@@ -255,6 +271,7 @@ def main() -> None:
         num_samples=args.num_samples,
         use_spinquant_r1=args.use_spinquant,
         use_spinquant_r2=args.use_spinquant,
+        use_spinquant_r3=args.use_spinquant,
     )
     data_loader = dataset_entries_to_dataloader(ds)
 
@@ -277,6 +294,8 @@ def main() -> None:
         Path(output_dir) / QCls.default_subfolder,
         r1=args.use_spinquant and args.component in r1_components,
         r2=args.use_spinquant and args.component in r2_components,
+        r3=args.use_spinquant and args.component in r3_components,
+        r4=args.use_spinquant and args.component in r4_components,
     )
     print(f"Recorded SpinQuant rotations in {marker}")
 

@@ -48,6 +48,7 @@ from qai_hub_models.models.pi05.model_adaptation import (
 from qai_hub_models.models.pi05.spinquant_r1 import (
     apply_action_expert_r1,
     apply_action_expert_r2,
+    apply_action_expert_r3,
     apply_backbone_rotations,
     apply_vision_r1,
     read_rotation_marker,
@@ -1670,6 +1671,8 @@ class Pi05PaliGemmaBackboneQuantizable(
         precision: Precision = Precision.w4a16,
         use_spinquant_r1: bool = False,
         use_spinquant_r2: bool = False,
+        use_spinquant_r3: bool = False,
+        use_spinquant_r4: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
@@ -1677,6 +1680,8 @@ class Pi05PaliGemmaBackboneQuantizable(
         self._precision = precision
         self._use_spinquant_r1 = use_spinquant_r1
         self._use_spinquant_r2 = use_spinquant_r2
+        self._use_spinquant_r3 = use_spinquant_r3
+        self._use_spinquant_r4 = use_spinquant_r4
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -1689,9 +1694,18 @@ class Pi05PaliGemmaBackboneQuantizable(
             # the quantizer scales computed below are calibrated on the
             # rotated weights. See spinquant_r1.py for why this only
             # rotates the backbone's internal weights, not an embedding,
-            # and for why R2 additionally requires a compensating action
-            # expert (not yet implemented).
-            apply_backbone_rotations(onnx_model, enable_r2=self._use_spinquant_r2)
+            # and for why R2/R3 additionally require a compensating action
+            # expert (apply_action_expert_r2 / apply_action_expert_r3). R4 is
+            # backbone-local (no action-expert counterpart), but is still
+            # passed explicitly rather than relying on enable_r4's
+            # follow-enable_r1 default, so it's independently controllable
+            # like R2/R3.
+            apply_backbone_rotations(
+                onnx_model,
+                enable_r2=self._use_spinquant_r2,
+                enable_r3=self._use_spinquant_r3,
+                enable_r4=self._use_spinquant_r4,
+            )
         quant_sim = QuantSimOnnx(
             model=onnx_model,
             quant_scheme=QuantScheme.min_max,
@@ -1727,6 +1741,8 @@ class Pi05PaliGemmaBackboneQuantizable(
         cls_kwargs: dict[str, Any] | None = None,
         use_spinquant_r1: bool = False,
         use_spinquant_r2: bool = False,
+        use_spinquant_r3: bool = False,
+        use_spinquant_r4: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         subfolder = subfolder or cls.default_subfolder
@@ -1743,6 +1759,8 @@ class Pi05PaliGemmaBackboneQuantizable(
             precision=precision,
             use_spinquant_r1=use_spinquant_r1,
             use_spinquant_r2=use_spinquant_r2,
+            use_spinquant_r3=use_spinquant_r3,
+            use_spinquant_r4=use_spinquant_r4,
         )
 
     def forward(  # type: ignore[override]
@@ -1782,12 +1800,14 @@ class Pi05ActionExpertQuantizable(
         onnx_bundle: ONNXBundle | None = None,
         precision: Precision = Precision.w8a16,
         use_spinquant_r2: bool = False,
+        use_spinquant_r3: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
         self.host_device = host_device
         self._precision = precision
         self._use_spinquant_r2 = use_spinquant_r2
+        self._use_spinquant_r3 = use_spinquant_r3
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -1801,6 +1821,11 @@ class Pi05ActionExpertQuantizable(
             # so scales are calibrated on the rotated weights. Only valid
             # against an R2 backbone -- see spinquant_r1.py.
             apply_action_expert_r2(onnx_model)
+        if self._use_spinquant_r3:
+            # Compensates the R3 rotation baked into the backbone's exported K
+            # caches; same ordering/calibration reasoning as R2 above. Only
+            # valid against an R3 backbone -- see spinquant_r1.py.
+            apply_action_expert_r3(onnx_model)
         quant_sim = QuantSimOnnx(
             model=onnx_model,
             quant_scheme=QuantScheme.min_max,
@@ -1913,6 +1938,7 @@ class Pi05ActionExpertQuantizable(
         cls_kwargs: dict[str, Any] | None = None,
         use_spinquant_r2: bool = False,
         use_spinquant_r1: bool = False,
+        use_spinquant_r3: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         ckpt_type = CheckpointType.from_checkpoint(checkpoint, subfolder="")
@@ -1933,6 +1959,7 @@ class Pi05ActionExpertQuantizable(
             onnx_bundle=bundle,
             precision=precision,
             use_spinquant_r2=use_spinquant_r2,
+            use_spinquant_r3=use_spinquant_r3,
         )
 
     def serialize(
@@ -2214,6 +2241,19 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
                 raise ValueError(
                     f"SpinQuant R2 mismatch in '{root}': backbone r2={backbone_r2} "
                     f"but action_expert r2={expert_r2}. R2 rotates the V caches "
+                    "the backbone hands the expert, so both components must be "
+                    "built with the same setting."
+                )
+
+            # R3 couples backbone and expert the same way R2 does, but for K:
+            # the backbone exports K caches rotated by R3 and the expert's own
+            # Q/K must be rotated to match. Same failure mode as R2 above.
+            backbone_r3 = read_rotation_marker(backbone_ckpt)["r3"]
+            expert_r3 = read_rotation_marker(expert_ckpt)["r3"]
+            if backbone_r3 != expert_r3:
+                raise ValueError(
+                    f"SpinQuant R3 mismatch in '{root}': backbone r3={backbone_r3} "
+                    f"but action_expert r3={expert_r3}. R3 rotates the K caches "
                     "the backbone hands the expert, so both components must be "
                     "built with the same setting."
                 )

@@ -72,6 +72,7 @@ from __future__ import annotations
 import json
 import re
 import types
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -115,17 +116,23 @@ _V_MODULE_PATTERN_PI05 = re.compile(r"^(v_proj|value|v)(_sha)?([._]\d+)?$")
 # structure for AIMET's role map to walk, so its ops are selected by name.
 _EXPERT_V_PATTERN = re.compile(r"^/self_attn/v_proj_sha\.\d+(_\d+)?/MatMul$")
 _EXPERT_O_PATTERN = re.compile(r"^/self_attn/o_proj(_\d+)?/MatMul$")
+_EXPERT_Q_PATTERN = re.compile(r"^/self_attn/q_proj_sha\.\d+(_\d+)?/MatMul$")
+_EXPERT_K_PATTERN = re.compile(r"^/self_attn/k_proj_sha\.\d+(_\d+)?/MatMul$")
 
 # Records which rotations a quantized backbone's weights were baked with, so
 # the deployment path can refuse a backbone/action-expert pair that disagree.
 SPINQUANT_MARKER = "spinquant_rotations.json"
 
 
-def write_rotation_marker(checkpoint_dir: str | Path, *, r1: bool, r2: bool) -> Path:
+def write_rotation_marker(
+    checkpoint_dir: str | Path, *, r1: bool, r2: bool, r3: bool = False, r4: bool = False
+) -> Path:
     """Record the rotations baked into a quantized checkpoint."""
     path = Path(checkpoint_dir) / SPINQUANT_MARKER
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"r1": r1, "r2": r2}, indent=2) + "\n")
+    path.write_text(
+        json.dumps({"r1": r1, "r2": r2, "r3": r3, "r4": r4}, indent=2) + "\n"
+    )
     return path
 
 
@@ -138,9 +145,14 @@ def read_rotation_marker(checkpoint_dir: str | Path) -> dict[str, bool]:
     """
     path = Path(checkpoint_dir) / SPINQUANT_MARKER
     if not path.is_file():
-        return {"r1": False, "r2": False}
+        return {"r1": False, "r2": False, "r3": False, "r4": False}
     data = json.loads(path.read_text())
-    return {"r1": bool(data.get("r1", False)), "r2": bool(data.get("r2", False))}
+    return {
+        "r1": bool(data.get("r1", False)),
+        "r2": bool(data.get("r2", False)),
+        "r3": bool(data.get("r3", False)),
+        "r4": bool(data.get("r4", False)),
+    }
 
 
 def get_r1_matrix(hidden_size: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -154,6 +166,16 @@ def get_r2_matrix(head_dim: int, dtype: torch.dtype = torch.float32) -> torch.Te
 
     Same construction as R1; the two differ only in the axis they act on --
     R1 on the residual stream (hidden_size), R2 per head (head_dim).
+    """
+    return torch.from_numpy(hadamard_rotation_matrix(head_dim)).to(dtype)
+
+
+def get_r3_matrix(head_dim: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Return the R3 = H / sqrt(head_dim) per-head rotation matrix.
+
+    Numerically identical to get_r2_matrix -- kept separately
+    because R2 and R3 rotate different tensors (V/o_proj vs. Q/K).
     """
     return torch.from_numpy(hadamard_rotation_matrix(head_dim)).to(dtype)
 
@@ -385,11 +407,77 @@ def _rotate_terminal_v_projections(
     return rotated
 
 
+def _index_consumers_by_tensor(
+    onnx_model: onnx.ModelProto,
+) -> dict[str, list[onnx.NodeProto]]:
+    """Return {tensor_name: [nodes consuming it]} for every node input in the graph."""
+    consumers: dict[str, list[onnx.NodeProto]] = {}
+    for node in onnx_model.graph.node:
+        for inp in node.input:
+            if inp:
+                consumers.setdefault(inp, []).append(node)
+    return consumers
+
+
+def _find_post_rope_hadamard_target(
+    consumers_by_tensor: dict[str, list[onnx.NodeProto]],
+    source_tensor: str,
+) -> tuple[str, list[onnx.NodeProto]]:
+    """
+    Return the post-RoPE anchor for R3 insertion.
+
+    - ``source_tensor`` is a q_proj/k_proj MatMul's output (pre-RoPE). 
+    - HF-style rotate_half RoPE (Reshape -> Split -> two Mul/Sub/Add branches -> Concat)
+    always merges back into exactly one Concat node before reaching any MatMul (QK^T)
+    - verified against both the backbone's and action expert's exported graphs.
+    - BFS forward from ``source_tensor``, collecting every Concat reached before
+    any MatMul: exactly one is expected. 
+    - Rotating its output rotates every downstream consumer in one insertion
+    for K in the backbone this is both 1) the block's own QK^T input and 
+    2) the exported k_cache_l{i} graph output, since both read the same post-Concat tensor.
+    - :raises ValueError: if the walk reaches a MatMul before any Concat, or
+        finds zero or more than one Concat.
+    """
+    visited: set[str] = set()
+    queue: deque[str] = deque([source_tensor])
+    concat_nodes: dict[str, onnx.NodeProto] = {}
+    while queue:
+        name = queue.popleft()
+        if name in visited:
+            continue
+        visited.add(name)
+        for node in consumers_by_tensor.get(name, []):
+            if node.op_type == "MatMul":
+                raise ValueError(
+                    f"R3 anchor search from '{source_tensor}': reached MatMul "
+                    f"'{node.name}' before any Concat -- expected a "
+                    f"rotate_half RoPE merge in between."
+                )
+            if node.op_type == "Concat":
+                concat_nodes[node.name] = node
+                continue
+            queue.extend(node.output)
+    if len(concat_nodes) != 1:
+        raise ValueError(
+            f"R3 anchor search from '{source_tensor}': expected exactly one "
+            f"post-RoPE Concat, found {len(concat_nodes)}: {sorted(concat_nodes)}."
+        )
+    concat_out = next(iter(concat_nodes.values())).output[0]
+    consumers = consumers_by_tensor.get(concat_out, [])
+    if not consumers:
+        raise ValueError(
+            f"R3 anchor search from '{source_tensor}': post-RoPE tensor "
+            f"'{concat_out}' has no consumers."
+        )
+    return concat_out, consumers
+
+
 def apply_backbone_rotations(
     onnx_model: onnx.ModelProto,
     *,
     enable_r1: bool = True,
     enable_r2: bool = False,
+    enable_r3: bool = False,
     enable_r4: bool | None = None,
 ) -> None:
     """
@@ -409,9 +497,17 @@ def apply_backbone_rotations(
     exported per-layer V caches -- which makes the resulting backbone valid
     only against an action expert built with apply_action_expert_r2.
 
-    R4 is a self-contained, backbone-local rotation with no action-expert coupling, 
-    so unlike R2 it needs no cross-component pairing flag. enable_r4 flag defaults 
-    to tracking enable_r1, so it turns on automatically wherever SpinQuant 
+    R3 rotates each block's post-RoPE Q and K immediately before QK^T (see
+    _rotate_backbone_r3). Both sides are activations with no weight to
+    absorb an inverse into, so -- like R4 -- this is a live MatMul, not a
+    fold. It makes the resulting backbone valid only against an action
+    expert built with apply_action_expert_r3, the same coupling R2 has with
+    apply_action_expert_r2. Defaults to False (unlike R4): enabling it
+    without a matching action expert silently corrupts attention.
+
+    R4 is a self-contained, backbone-local rotation with no action-expert coupling,
+    so unlike R2 it needs no cross-component pairing flag. enable_r4 flag defaults
+    to tracking enable_r1, so it turns on automatically wherever SpinQuant
     (enable_r1) is enabled, while also allowing an explicit override.
 
     Parameters
@@ -424,8 +520,11 @@ def apply_backbone_rotations(
         R1 is not idempotent.
     enable_r2
         Also apply the R2 per-head V/O rotation.
+    enable_r3
+        Also apply the R3 per-head Q/K rotation (see _rotate_backbone_r3).
+        Defaults to False -- requires a matching apply_action_expert_r3.
     enable_r4
-        Also apply R4 (FFN down_proj input rotation -- see _rotate_backbone_r4). 
+        Also apply R4 (FFN down_proj input rotation -- see _rotate_backbone_r4).
         Defaults to None, which means "follow enable_r1"
         -- pass True/False explicitly to control it independently.
     """
@@ -436,7 +535,7 @@ def apply_backbone_rotations(
     boundaries, active_norms = get_decoder_block_boundaries(onnx_model, cg)
     role_map = get_decoder_role_map(cg, boundaries, active_norms)
     hidden_size = infer_hidden_size(onnx_model, role_map)
-    head_dim = infer_backbone_head_dim(onnx_model) if enable_r2 else None
+    head_dim = infer_backbone_head_dim(onnx_model) if (enable_r2 or enable_r3) else None
     ctx = SpinquantContext(
         backbone_model=onnx_model,
         backbone_role_map=role_map,
@@ -464,6 +563,14 @@ def apply_backbone_rotations(
         # AIMET's own R3RotationPass), which invalidates role_map for any
         # pass run afterward.
         _rotate_backbone_r4(onnx_model, role_map)
+
+    if enable_r3:
+        assert head_dim is not None
+        # Must run last: R3, like R4, inserts new nodes rather than mutating
+        # existing weights, so it must follow every role-map-dependent pass
+        # (R1/R2/R4 above) -- matching AIMET's own R3RotationPass discipline
+        # ("R3 is the last pass in the pipeline").
+        _rotate_backbone_r3(onnx_model, role_map, head_dim)
 
 
 def _rotate_backbone_r4(
@@ -523,6 +630,83 @@ def _rotate_backbone_r4(
             )
             rotate_linear_weight(onnx_model, op, R4, is_writing=False)
             rotated.append(op.name)
+    return rotated
+
+
+def _rotate_backbone_r3(
+    onnx_model: onnx.ModelProto, role_map: DecoderModelRoleMap, head_dim: int
+) -> list[str]:
+    """
+    Insert online R3 Hadamard rotations on Q and K, immediately after RoPE, in place.
+
+    - R3 rotates the post-RoPE Q and K activations.
+    Because ``(Q @ H) @ (K @ H)^T == Q @ K^T`` for H, the two rotations cancel 
+    inside the attention matmul with no weight on either side to fuse into 
+    (unlike R1/R2)-- so, like R4, this must be a live MatMul.
+
+    - Every block in role_map.blocks gets both Q and K rotated. The last block 
+    (role_map.lm_head; see _rotate_terminal_v_projections for why R2 special-cases
+    the same block) has no q_proj/o_proj and exists only to emit K/V for the 
+    action expert -- so only its K is rotated; 
+    there is no in-block QK^T for a Q side to cancel against.
+
+    - A backbone rotated this way is only correct paired with an action expert
+    built with apply_action_expert_r: every k_cache_l{i} this emits becomes 
+    the action expert's per-layer K-cache input, concatenated with the 
+    expert's own RoPE'd K before its own QK^T. 
+    The same coupling R2 already has for V/O.
+
+    Parameters
+    ----------
+    onnx_model
+        Backbone ONNX model. Mutated in place.
+    role_map
+        Role map produced by get_decoder_role_map, from before R4 ran.
+    head_dim
+        Per-head rotation size (same convention as R2).
+
+    Returns
+    -------
+    rotated : list[str]
+        Names of the q_proj/k_proj ops whose downstream RoPE output was rotated.
+    """
+    consumers_by_tensor = _index_consumers_by_tensor(onnx_model)
+    rotated: list[str] = []
+
+    def _rotate(op: Op, tag: str) -> None:
+        source_tensor = op.get_module().output[0]
+        target, consumers = _find_post_rope_hadamard_target(
+            consumers_by_tensor, source_tensor
+        )
+        insert_online_hadamard_node(
+            onnx_model,
+            target_tensor_name=target,
+            consumer_nodes=consumers,
+            head_dim=head_dim,
+            name_prefix=f"spinquant_{op.name.strip('/')}_{tag}_R3",
+        )
+        rotated.append(op.name)
+
+    for block in role_map.blocks:
+        q_ops = [op for op in block.qkv_linears if "/q_proj" in op.name]
+        k_ops = [op for op in block.qkv_linears if "/k_proj" in op.name]
+        if len(q_ops) != 1 or len(k_ops) != 1:
+            raise ValueError(
+                "R3 rotation: block expected exactly one q_proj and one "
+                f"k_proj, found q={[o.name for o in q_ops]} "
+                f"k={[o.name for o in k_ops]}."
+            )
+        _rotate(q_ops[0], "q")
+        _rotate(k_ops[0], "k")
+
+    terminal_k_ops = [op for op in role_map.lm_head if "/k_proj" in op.name]
+    if len(terminal_k_ops) != 1:
+        raise ValueError(
+            "R3 rotation: expected exactly one terminal (lm_head) k_proj, "
+            f"found {[op.name for op in terminal_k_ops]}."
+        )
+    _rotate(terminal_k_ops[0], "k")
+
     return rotated
 
 
@@ -612,6 +796,59 @@ def apply_action_expert_r2(onnx_model: onnx.ModelProto) -> tuple[int, int]:
             "op naming may have changed."
         )
     return n_v, n_o
+
+
+def apply_action_expert_r3(onnx_model: onnx.ModelProto) -> tuple[int, int]:
+    """
+    Apply the R3 compensation to the action expert, in place.
+
+    - Pairs with `apply_backbone_rotations(..., enable_r3=True)`
+    - Backbone hands per-layer R3-rotated K caches (_rotate_backbone_r3)-- 
+    the expert's post-RoPE Q and K must be rotated by same H for its QK^T 
+    to be correct (SHAGemmaExpertAttention concatenates the backbone's 
+    rotated K-cache with its own freshly-computed K before attention)
+    - same failure mode apply_action_expert_r2 already guards against for V/O.
+
+    Parameters
+    ----------
+    onnx_model
+        Action expert ONNX model. Mutated in place.
+
+    Returns
+    -------
+    counts : tuple[int, int]
+        Number of (q_proj_sha, k_proj_sha) ops rotated.
+    """
+    head_dim = infer_expert_head_dim(onnx_model)
+    consumers_by_tensor = _index_consumers_by_tensor(onnx_model)
+
+    n_q = n_k = 0
+    for node in onnx_model.graph.node:
+        name = node.name or ""
+        is_q = bool(_EXPERT_Q_PATTERN.match(name))
+        is_k = bool(_EXPERT_K_PATTERN.match(name))
+        if not (is_q or is_k):
+            continue
+        target, consumers = _find_post_rope_hadamard_target(
+            consumers_by_tensor, node.output[0]
+        )
+        insert_online_hadamard_node(
+            onnx_model,
+            target_tensor_name=target,
+            consumer_nodes=consumers,
+            head_dim=head_dim,
+            name_prefix=f"spinquant_{name.strip('/')}_R3",
+        )
+        n_q += is_q
+        n_k += is_k
+
+    if n_q == 0 or n_k == 0 or n_q % n_k != 0:
+        raise ValueError(
+            "Action expert R3: expected a non-zero q_proj_sha count that's a "
+            f"multiple of the k_proj_sha count (GQA group size), found "
+            f"q={n_q}, k={n_k}. The expert's op naming may have changed."
+        )
+    return n_q, n_k
 
 
 class _R1WrappedAdaRMSNorm(torch.nn.Module):
