@@ -97,6 +97,7 @@ from aimet_onnx.experimental.spinquant.passes.r2 import _get_rotated_axis_size
 from aimet_onnx.experimental.spinquant.transforms import (
     block_diag_repeat,
     hadamard_rotation_matrix,
+    insert_online_hadamard_node,
     rotate_linear_weight,
 )
 from aimet_onnx.meta.connectedgraph import ConnectedGraph
@@ -385,7 +386,11 @@ def _rotate_terminal_v_projections(
 
 
 def apply_backbone_rotations(
-    onnx_model: onnx.ModelProto, *, enable_r1: bool = True, enable_r2: bool = False
+    onnx_model: onnx.ModelProto,
+    *,
+    enable_r1: bool = True,
+    enable_r2: bool = False,
+    enable_r4: bool | None = None,
 ) -> None:
     """
     Apply SpinQuant rotations to the backbone's internal weights, in place.
@@ -404,6 +409,11 @@ def apply_backbone_rotations(
     exported per-layer V caches -- which makes the resulting backbone valid
     only against an action expert built with apply_action_expert_r2.
 
+    R4 is a self-contained, backbone-local rotation with no action-expert coupling, 
+    so unlike R2 it needs no cross-component pairing flag. enable_r4 flag defaults 
+    to tracking enable_r1, so it turns on automatically wherever SpinQuant 
+    (enable_r1) is enabled, while also allowing an explicit override.
+
     Parameters
     ----------
     onnx_model
@@ -414,7 +424,14 @@ def apply_backbone_rotations(
         R1 is not idempotent.
     enable_r2
         Also apply the R2 per-head V/O rotation.
+    enable_r4
+        Also apply R4 (FFN down_proj input rotation -- see _rotate_backbone_r4). 
+        Defaults to None, which means "follow enable_r1"
+        -- pass True/False explicitly to control it independently.
     """
+    if enable_r4 is None:
+        enable_r4 = enable_r1
+
     cg = ConnectedGraph(onnx_model)
     boundaries, active_norms = get_decoder_block_boundaries(onnx_model, cg)
     role_map = get_decoder_role_map(cg, boundaries, active_norms)
@@ -441,9 +458,76 @@ def apply_backbone_rotations(
             r2.apply(ctx)
         _rotate_terminal_v_projections(onnx_model, role_map, head_dim)
 
+    if enable_r4:
+        # Must run after R1/R2: both are weight-only mutations that leave
+        # role_map's Op/node identities valid, but R4 inserts new nodes (like
+        # AIMET's own R3RotationPass), which invalidates role_map for any
+        # pass run afterward.
+        _rotate_backbone_r4(onnx_model, role_map)
+
+
+def _rotate_backbone_r4(
+    onnx_model: onnx.ModelProto, role_map: DecoderModelRoleMap
+) -> list[str]:
+    """
+    Insert an online R4 Hadamard rotation on each MLP down_proj's input, in place.
+
+    R4 rotates the FFN intermediate activation (the Swish-gated up/gate
+    product) immediately before down_proj, reducing outliers for activation
+    quantization at that point. It sits downstream of Swish's nonlinearity, so
+    -- unlike R1/R2 -- it cannot be folded into up_proj/gate_proj; it must be a
+    live MatMul. aimet_onnx has no R4RotationPass to call, so this follows the
+    same two-step pattern AIMET's own R3RotationPass uses by hand:
+    insert_online_hadamard_node for the live rotation, then
+    rotate_linear_weight(..., is_writing=False) so down_proj absorbs the
+    compensating inverse and the float output is unchanged.
+
+    Each op in role_map.blocks[i].down_proj is rotated independently, sized to
+    its own input width -- this covers a single down_proj per block as well as
+    a split one (e.g. GemmaMLPSplitLinear's per-chunk projections), since each
+    chunk's rotation is self-contained and chunks are only combined after
+    down_proj.
+
+    Parameters
+    ----------
+    onnx_model
+        Backbone ONNX model. Mutated in place.
+    role_map
+        Role map produced by get_decoder_role_map, from before R1/R2 ran (safe
+        to reuse: R1/R2 only rewrite initializer values, not graph structure).
+
+    Returns
+    -------
+    rotated : list[str]
+        Names of the down_proj ops that were rotated.
+    """
+    initializers = {i.name for i in onnx_model.graph.initializer}
+    rotated: list[str] = []
+    for block_idx, block in enumerate(role_map.blocks):
+        for chunk_idx, op in enumerate(block.down_proj):
+            node = op.get_module()
+            activations = [i for i in node.input if i not in initializers]
+            if len(activations) != 1:
+                raise ValueError(
+                    f"down_proj op '{op.name}' (block {block_idx}): expected "
+                    f"exactly one activation input, found {activations}."
+                )
+            in_size = _get_rotated_axis_size(onnx_model, op, is_writing=False)
+            R4 = hadamard_rotation_matrix(in_size)
+            insert_online_hadamard_node(
+                onnx_model,
+                target_tensor_name=activations[0],
+                consumer_nodes=[node],
+                head_dim=in_size,
+                name_prefix=f"spinquant_block{block_idx}_down{chunk_idx}_R4",
+            )
+            rotate_linear_weight(onnx_model, op, R4, is_writing=False)
+            rotated.append(op.name)
+    return rotated
+
 
 def apply_backbone_r1(onnx_model: onnx.ModelProto) -> None:
-    """Apply R1 only. Thin wrapper kept for existing callers."""
+    """Apply R1 (and R4, which follows it by default). Thin wrapper kept for existing callers."""
     apply_backbone_rotations(onnx_model, enable_r2=False)
 
 
@@ -483,6 +567,9 @@ def apply_action_expert_r2(onnx_model: onnx.ModelProto) -> tuple[int, int]:
 
     Uses the same axis conventions as AIMET's R2RotationPass (V on the writing
     axis, o_proj on the reading axis), so the two cancel exactly.
+
+    Does not apply R4 -- the action expert has no R4 support.
+    (Takes way too long)
 
     Parameters
     ----------
