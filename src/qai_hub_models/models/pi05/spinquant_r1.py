@@ -119,13 +119,23 @@ _EXPERT_O_PATTERN = re.compile(r"^/self_attn/o_proj(_\d+)?/MatMul$")
 _EXPERT_Q_PATTERN = re.compile(r"^/self_attn/q_proj_sha\.\d+(_\d+)?/MatMul$")
 _EXPERT_K_PATTERN = re.compile(r"^/self_attn/k_proj_sha\.\d+(_\d+)?/MatMul$")
 
+# The expert's MLP keeps HF's plain GemmaMLP (only the backbone's is replaced
+# with GemmaMLPSplitLinear), so its down_proj exports one MatMul per layer as
+# `/mlp/down_proj_<layer>/MatMul`, layer 0 again carrying no `_<layer>` suffix.
+_EXPERT_DOWN_PATTERN = re.compile(r"^/mlp/down_proj(_\d+)?/MatMul$")
+
 # Records which rotations a quantized backbone's weights were baked with, so
 # the deployment path can refuse a backbone/action-expert pair that disagree.
 SPINQUANT_MARKER = "spinquant_rotations.json"
 
 
 def write_rotation_marker(
-    checkpoint_dir: str | Path, *, r1: bool, r2: bool, r3: bool = False, r4: bool = False
+    checkpoint_dir: str | Path,
+    *,
+    r1: bool,
+    r2: bool,
+    r3: bool = False,
+    r4: bool = False,
 ) -> Path:
     """Record the rotations baked into a quantized checkpoint."""
     path = Path(checkpoint_dir) / SPINQUANT_MARKER
@@ -505,10 +515,9 @@ def apply_backbone_rotations(
     apply_action_expert_r2. Defaults to False (unlike R4): enabling it
     without a matching action expert silently corrupts attention.
 
-    R4 is a self-contained, backbone-local rotation with no action-expert coupling,
-    so unlike R2 it needs no cross-component pairing flag. enable_r4 flag defaults
-    to tracking enable_r1, so it turns on automatically wherever SpinQuant
-    (enable_r1) is enabled, while also allowing an explicit override.
+    R4 is self-contained; unlike R2/R3 it needs no cross-component pairing flag. 
+    enable_r4 defaults to tracking enable_r1, so it turns on wherever SpinQuant (enable_r1)
+    is enabled, while also allowing an explicit override.
 
     Parameters
     ----------
@@ -752,9 +761,6 @@ def apply_action_expert_r2(onnx_model: onnx.ModelProto) -> tuple[int, int]:
     Uses the same axis conventions as AIMET's R2RotationPass (V on the writing
     axis, o_proj on the reading axis), so the two cancel exactly.
 
-    Does not apply R4 -- the action expert has no R4 support.
-    (Takes way too long)
-
     Parameters
     ----------
     onnx_model
@@ -798,14 +804,86 @@ def apply_action_expert_r2(onnx_model: onnx.ModelProto) -> tuple[int, int]:
     return n_v, n_o
 
 
+def apply_action_expert_r4(onnx_model: onnx.ModelProto) -> int:
+    """
+    Insert an online R4 Hadamard rotation on each MLP down_proj's input, in place.
+
+    - The expert-side twin of `_rotate_backbone_r4`
+    - self-contained: the inserted rotation and inverse folded into down_proj 
+      both live inside this graph, so unlike R2/R3 there is no backbone counterpart 
+      to pair with. 
+    - Selected by op name rather than by a role map, for the same reason
+      apply_action_expert_r2/r3 are: the expert is a cross-attention stack with
+      no decoder-block structure for `get_decoder_role_map` to walk.
+    - One rotation per layer, sized to that down_proj's own input width. The
+      expert keeps HF's unsplit GemmaMLP, so that width is the full
+      intermediate size (4096) rather than the backbone's per-chunk 2048 (see
+      GemmaMLPSplitLinear): 18 [4096, 4096] fp32 initializers, +1.21 GB on a
+      float export that is already 2.17 GB. That is the whole cost. Measured
+      against the R1-folded float export on CPU: QuantSim construction 24s ->
+      34s, calibration forward 0.7s -> 0.8s, seqMSE (2 samples) 301s -> 312s,
+      plus a one-off ~25s to apply. An earlier attempt at expert R4 was
+      abandoned as far too slow to quantize; none of that slowness reproduces
+      through this path, so if it returns, suspect the surrounding harness
+      (host device, external-data spilling on a >2 GB ModelProto) rather than
+      the rotation itself.
+
+    Parameters
+    ----------
+    onnx_model
+        Action expert ONNX model. Mutated in place.
+
+    Returns
+    -------
+    count : int
+        Number of down_proj ops rotated.
+    """
+    cg = ConnectedGraph(onnx_model)
+    initializers = {i.name for i in onnx_model.graph.initializer}
+
+    # Snapshot the node list: insert_online_hadamard_node splices new nodes
+    # into graph.node, and mutating a protobuf repeated field while iterating
+    # it would skip or revisit entries.
+    n_down = 0
+    for node in list(onnx_model.graph.node):
+        if not _EXPERT_DOWN_PATTERN.match(node.name or ""):
+            continue
+        activations = [i for i in node.input if i not in initializers]
+        if len(activations) != 1:
+            raise ValueError(
+                f"Action expert down_proj '{node.name}': expected exactly one "
+                f"activation input, found {activations}."
+            )
+        op = cg.get_op_from_module_name(node.name)
+        in_size = _get_rotated_axis_size(onnx_model, op, is_writing=False)
+        R4 = hadamard_rotation_matrix(in_size)
+        insert_online_hadamard_node(
+            onnx_model,
+            target_tensor_name=activations[0],
+            consumer_nodes=[node],
+            head_dim=in_size,
+            name_prefix=f"spinquant_{node.name.strip('/')}_R4",
+        )
+        rotate_linear_weight(onnx_model, op, R4, is_writing=False)
+        n_down += 1
+
+    if n_down == 0:
+        raise ValueError(
+            "Action expert R4: found no down_proj MatMul ops matching "
+            f"'{_EXPERT_DOWN_PATTERN.pattern}'. The expert's op naming may "
+            "have changed."
+        )
+    return n_down
+
+
 def apply_action_expert_r3(onnx_model: onnx.ModelProto) -> tuple[int, int]:
     """
     Apply the R3 compensation to the action expert, in place.
 
     - Pairs with `apply_backbone_rotations(..., enable_r3=True)`
-    - Backbone hands per-layer R3-rotated K caches (_rotate_backbone_r3)-- 
-    the expert's post-RoPE Q and K must be rotated by same H for its QK^T 
-    to be correct (SHAGemmaExpertAttention concatenates the backbone's 
+    - Backbone hands per-layer R3-rotated K caches (_rotate_backbone_r3)--
+    the expert's post-RoPE Q and K must be rotated by same H for its QK^T
+    to be correct (SHAGemmaExpertAttention concatenates the backbone's
     rotated K-cache with its own freshly-computed K before attention)
     - same failure mode apply_action_expert_r2 already guards against for V/O.
 

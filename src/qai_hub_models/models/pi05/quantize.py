@@ -50,9 +50,10 @@ Usage:
     the action expert.
   * R3 (per-head Q/K, online rotation) to the backbone, and the matching
     compensation to the action expert. No effect on vision_encoder.
-  * R4 (FFN down_proj input) to the backbone only -- self-contained, no
-    action-expert coupling (not applied there; too slow currently). Recorded
-    in the marker for record-keeping only, like action_expert's own R1.
+  * R4 (FFN down_proj input) to the backbone and to the action expert. 
+    - Like the expert's own R1 it is self-contained per component--
+      there is no cross-component coupling to validate 
+    - See apply_action_expert_r4.
 
 R1 on vision_encoder/backbone and R2/R3 on backbone/action_expert couple those
 components: R1 links vision_encoder -> backbone, R2 and R3 each independently
@@ -167,8 +168,8 @@ def main() -> None:
             "residual stream (R1), the per-head V/o_proj path (R2), the "
             "per-head Q/K path (R3), and the FFN down_proj input (R4); on "
             "the action expert it applies its own independent "
-            "residual-stream R1 plus the matching R2/R3 compensation for "
-            "the backbone's R2/R3 (R4 is backbone-only). No effect on "
+            "residual-stream R1 and down_proj-input R4, plus the matching "
+            "R2/R3 compensation for the backbone's R2/R3. No effect on "
             "--component vision_encoder beyond R1. Because R2/R3 couple "
             "backbone and action_expert, both must be built with this flag "
             "together. See spinquant_r1.py."
@@ -189,12 +190,12 @@ def main() -> None:
     # R1 links vision_encoder -> backbone (shared rotation); on action_expert
     # it's an independent, self-contained rotation with no cross-component
     # coupling (see apply_action_expert_r1 in spinquant_r1.py). R2 and R3
-    # each independently link backbone -> action_expert. R4 is backbone-only,
-    # self-contained -- no action-expert counterpart.
+    # each independently link backbone -> action_expert. R4 applies to both,
+    # but self-contained within each -- no cross-component counterpart.
     r1_components = ("vision_encoder", "backbone", "action_expert")
     r2_components = ("backbone", "action_expert")
     r3_components = ("backbone", "action_expert")
-    r4_components = ("backbone",)
+    r4_components = ("backbone", "action_expert")
     rotated_components = ("vision_encoder", "backbone", "action_expert")
     if args.use_spinquant:
         others = [c for c in rotated_components if c != args.component]

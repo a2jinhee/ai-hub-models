@@ -49,6 +49,7 @@ from qai_hub_models.models.pi05.spinquant_r1 import (
     apply_action_expert_r1,
     apply_action_expert_r2,
     apply_action_expert_r3,
+    apply_action_expert_r4,
     apply_backbone_rotations,
     apply_vision_r1,
     read_rotation_marker,
@@ -1801,6 +1802,7 @@ class Pi05ActionExpertQuantizable(
         precision: Precision = Precision.w8a16,
         use_spinquant_r2: bool = False,
         use_spinquant_r3: bool = False,
+        use_spinquant_r4: bool = False,
     ) -> None:
         AIMETOnnxQuantizableMixin.__init__(self, sim_model, onnx_bundle=onnx_bundle)
         BaseModel.__init__(self, None)
@@ -1808,6 +1810,7 @@ class Pi05ActionExpertQuantizable(
         self._precision = precision
         self._use_spinquant_r2 = use_spinquant_r2
         self._use_spinquant_r3 = use_spinquant_r3
+        self._use_spinquant_r4 = use_spinquant_r4
 
     def make_quant_sim(self) -> QuantSimOnnx | None:
         if self._onnx_bundle is None:
@@ -1821,6 +1824,11 @@ class Pi05ActionExpertQuantizable(
             # so scales are calibrated on the rotated weights. Only valid
             # against an R2 backbone -- see spinquant_r1.py.
             apply_action_expert_r2(onnx_model)
+        if self._use_spinquant_r4:
+            # Backbone-independent (nothing crosses the component boundary),
+            # but ordered like the backbone's R4: after the weight-only R2
+            # above, before the node-inserting R3 below. See spinquant_r1.py.
+            apply_action_expert_r4(onnx_model)
         if self._use_spinquant_r3:
             # Compensates the R3 rotation baked into the backbone's exported K
             # caches; same ordering/calibration reasoning as R2 above. Only
@@ -1939,6 +1947,7 @@ class Pi05ActionExpertQuantizable(
         use_spinquant_r2: bool = False,
         use_spinquant_r1: bool = False,
         use_spinquant_r3: bool = False,
+        use_spinquant_r4: bool = False,
     ) -> Self:
         host_device = torch.device(host_device)
         ckpt_type = CheckpointType.from_checkpoint(checkpoint, subfolder="")
@@ -1960,6 +1969,7 @@ class Pi05ActionExpertQuantizable(
             precision=precision,
             use_spinquant_r2=use_spinquant_r2,
             use_spinquant_r3=use_spinquant_r3,
+            use_spinquant_r4=use_spinquant_r4,
         )
 
     def serialize(
