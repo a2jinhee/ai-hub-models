@@ -3,68 +3,57 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
 """
-SpinQuant R1 / R2 rotation helpers for Pi05's backbone.
+SpinQuant R1/R2/R3/R4 rotation helpers for Pi05'.
+(The module covers other rotations despite its name `spinquant_r1`.)
 
-(The module keeps its historical `spinquant_r1` name; it now covers R2 too.)
+* R1 rotation
+- `Pi05PaliGemmaBackboneQuantizable` takes an embedded `hidden_state` as input
+ (see Pi05PaliGemmaTokenEmbed)
+- R1 rotation of the backbone's internal weights 
+(done via`aimet_onnx.experimental.spinquant.apply_spinquant` in make_quant_sim)
+requires `hidden_state` to be pre-rotated: hidden_state_rot = hidden_state @ R1.
+- R1 is folded into the vision encoder's weights;
+    - Similar to how AIMET does for the equivalent VLM backbone 
+    with use_inputs_embeds=True
+    - see`_rotate_merger_linear2` and `_rotate_external_embedding` 
+    in aimet_onnx's R1RotationPass. 
 
-`Pi05PaliGemmaBackboneQuantizable` takes an already-embedded `hidden_state`
-as input rather than raw token ids (see Pi05PaliGemmaTokenEmbed), so R1
-rotation of the backbone's internal weights (done via
-`aimet_onnx.experimental.spinquant.apply_spinquant` in make_quant_sim)
-requires `hidden_state` to arrive pre-rotated: hidden_state_rot = hidden_state @ R1.
+- hidden_state = 
+    `prefix_emb = concat([img_embed, ..., lang_emb], dim=seq)`
+- Rotate each component then concat, instead of doing the opposite
+    `concat([A, B], dim=seq) @ R1  ==  concat([A @ R1, B @ R1], dim=seq)`
 
-That rotation is folded into the weights that *produce* hidden_state, which
-is what AIMET does for the equivalent VLM topology (a backbone exported with
-use_inputs_embeds=True): see `_rotate_merger_linear2` and
-`_rotate_external_embedding` in aimet_onnx's R1RotationPass. hidden_state is
+    1. vision projector: apply_vision_r1, folds R1 into the multi_modal
+        projector's weight *and* bias (the last MatMul+Add of the vision ONNX)
+    2. language embedding: rotate_embedding_weight, W <- W @ R1 on the
+        [vocab, hidden] table, folded at Pi05PaliGemmaTokenEmbed build time
 
-    prefix_emb = concat([img_embed, ..., lang_emb], dim=seq)
-
-and R1 acts on the hidden axis, so it commutes with the sequence-axis concat.
-Rotating each producer independently therefore yields a rotated concatenation:
-
-  1. vision projector   -- apply_vision_r1, folds R1 into the multi_modal
-     projector's weight *and* bias (the last MatMul+Add of the vision ONNX)
-  2. language embedding -- rotate_embedding_weight, W <- W @ R1 on the
-     [vocab, hidden] table, folded at Pi05PaliGemmaTokenEmbed build time
-  3. zero padding for absent cameras -- 0 @ R1 == 0, nothing to do
-
-Folding rather than rotating the activation at runtime matters for the device
-export: an activation rotation is a [968, 2048] @ [2048, 2048] matmul that
-lives in no exported graph, so it would land on the host between two NPU
-components -- exactly the online-rotation cost R3/R4 were dropped to avoid.
-Folding also puts R1 *before* the vision encoder's output quantizer, so the
-vision->backbone activation is calibrated on rotated (outlier-suppressed)
-values instead of unrotated ones.
-
-The shared, lru_cache'd `load_checkpoint` policy is never mutated: the vision
+- The shared, lru_cache'd `load_checkpoint` policy is never mutated: the vision
 rotation edits the exported ONNX ModelProto, and the embedding rotation is
 held as a buffer on Pi05PaliGemmaTokenEmbed rather than written back into the
-shared nn.Embedding.
+shared nn.Embedding. ?? I don't understand this... 
+- apply_vision_r1 takes an onnx.ModelProto and mutates it in place (spinquant_r1.py), 
+a separate ONNX file/object entirely outside the cached torch policy. 
 
-R2 (per-head V/O rotation) carries an extra obligation on Pi05 that it does
-not carry on a plain LLM. R2's correctness argument is that the rotation of
-V's output channels cancels against the inverse rotation of o_proj's input
-rows, because attention output is linear in V along head_dim. That
-cancellation only covers the path *through* o_proj. Pi05's backbone is a
-prefill KV *producer*: every block's V also leaves the graph as a per-layer
-cache that the action expert consumes, and on that path nothing cancels.
+* R2 rotation
+- R2 (per-head V/O rotation) on Pi05 introduces a problem not seen on a plain LLM. 
+- R2-rotated V outputs cancels with inverse rotation of o_proj's inputs, 
+    when o_proj is applied directly to V's output.
+- However, Pi05 also exports llm backbone KV as a per-layer cache to action expert
 
-So a backbone rotated by R2 is only correct when paired with an action expert
-that compensates. Verified numerically, the compensation is three-part:
+- Verified numerically, the compensation is three-part:
 
-  1. backbone V rotated by R2      (apply_backbone_rotations, enable_r2=True)
+  1. backbone V rotated by R2      (apply_backbone_rotations)
   2. expert v_proj_sha rotated     (apply_action_expert_r2)
   3. expert o_proj absorbs R2.T    (apply_action_expert_r2)
 
-Step 2 is required, not optional: SHAGemmaExpertAttention concatenates the
-prefix v_cache with its own v_proj_sha output before attention, so absorbing
-R2.T into o_proj alone un-rotates both halves and corrupts the suffix (a
-39% error, versus 3.6e-07 when all three are applied).
+- SHAGemmaExpertAttention concats [prefix v_cache, own v_proj_sha output]
+- R2.T is fused into o_proj to un-rotate concatenated V.
+- R2 backbone and its action expert must be built and served as a pair. 
 
-Because of this coupling, an R2 backbone and its action expert must be built
-and served as a pair. Each quantized component records which rotations it was
-built with (see SPINQUANT_MARKER), and the deployment path refuses a mismatch.
+NOTE:
+- Each quantized component records which rotations it was built with 
+(see SPINQUANT_MARKER). 
 """
 
 from __future__ import annotations
@@ -588,29 +577,26 @@ def _rotate_backbone_r4(
     """
     Insert an online R4 Hadamard rotation on each MLP down_proj's input, in place.
 
-    R4 rotates the FFN intermediate activation (the Swish-gated up/gate
-    product) immediately before down_proj, reducing outliers for activation
-    quantization at that point. It sits downstream of Swish's nonlinearity, so
-    -- unlike R1/R2 -- it cannot be folded into up_proj/gate_proj; it must be a
-    live MatMul. aimet_onnx has no R4RotationPass to call, so this follows the
-    same two-step pattern AIMET's own R3RotationPass uses by hand:
+    - R4 rotates the FFN intermediate activation 
+        (the Swish-gated up/gate product), immediately before down_proj.
+    - It sits downstream of Swish's nonlinearity, so unlike R1/R2,
+        it cannot be folded into up_proj/gate_proj; it must be a live MatMul. 
+    - aimet_onnx has no R4RotationPass, so this follows AIMET's R3RotationPass:
     insert_online_hadamard_node for the live rotation, then
-    rotate_linear_weight(..., is_writing=False) so down_proj absorbs the
-    compensating inverse and the float output is unchanged.
+    rotate_linear_weight(..., is_writing=False) fuses the inverse R4 to down_proj.
 
-    Each op in role_map.blocks[i].down_proj is rotated independently, sized to
-    its own input width -- this covers a single down_proj per block as well as
-    a split one (e.g. GemmaMLPSplitLinear's per-chunk projections), since each
-    chunk's rotation is self-contained and chunks are only combined after
-    down_proj.
+    - Each op in role_map.blocks[i].down_proj is rotated independently
+    - This works whether down_proj is one single op, 
+        or split into chunks (like GemmaMLPSplitLinear) 
+        since each chunk only sees its own slice of the input, 
+        and chunks are only combined after down_proj.
 
     Parameters
     ----------
     onnx_model
         Backbone ONNX model. Mutated in place.
     role_map
-        Role map produced by get_decoder_role_map, from before R1/R2 ran (safe
-        to reuse: R1/R2 only rewrite initializer values, not graph structure).
+        Role map produced by get_decoder_role_map, from before R1/R2 ran.
 
     Returns
     -------
@@ -646,31 +632,29 @@ def _rotate_backbone_r3(
     onnx_model: onnx.ModelProto, role_map: DecoderModelRoleMap, head_dim: int
 ) -> list[str]:
     """
-    Insert online R3 Hadamard rotations on Q and K, immediately after RoPE, in place.
+    Insert online R3 Hadamard rotations on post-RoPE Q/K activations, in place.
 
-    - R3 rotates the post-RoPE Q and K activations.
-    Because ``(Q @ H) @ (K @ H)^T == Q @ K^T`` for H, the two rotations cancel 
-    inside the attention matmul with no weight on either side to fuse into 
-    (unlike R1/R2)-- so, like R4, this must be a live MatMul.
+    - R3 rotates the post-RoPE Q/K activations as a live MatMul node.
+    - ``(Q @ H) @ (K @ H)^T == Q @ K^T``, the two H cancel inside 
+        the matmul with no weight on either side to fuse into (unlike R1/R2)
 
-    - Every block in role_map.blocks gets both Q and K rotated. The last block 
-    (role_map.lm_head; see _rotate_terminal_v_projections for why R2 special-cases
-    the same block) has no q_proj/o_proj and exists only to emit K/V for the 
-    action expert -- so only its K is rotated; 
-    there is no in-block QK^T for a Q side to cancel against.
-
-    - A backbone rotated this way is only correct paired with an action expert
-    built with apply_action_expert_r: every k_cache_l{i} this emits becomes 
-    the action expert's per-layer K-cache input, concatenated with the 
-    expert's own RoPE'd K before its own QK^T. 
-    The same coupling R2 already has for V/O.
+    - Every block in role_map.blocks gets both Q/K rotated. 
+    - The last block (role_map.lm_head) has no q_proj/o_proj 
+        and exists only to emit K/V for the action expert 
+        so only its K is rotated; with no QK^T to cancel against (no q_proj)
+        see _rotate_terminal_v_projections for why R2 special-cases the same block
+    
+    - An R3 backbone must be coupled with apply_action_expert_r3 
+    - Every k_cache_l{i} becomes the action expert's per-layer K-cache input, 
+        concatenated with the expert's own RoPE'd K before its own QK^T. 
+    - The same coupling R2 already has for V/O.
 
     Parameters
     ----------
     onnx_model
         Backbone ONNX model. Mutated in place.
     role_map
-        Role map produced by get_decoder_role_map, from before R4 ran.
+        Role map produced by get_decoder_role_map.
     head_dim
         Per-head rotation size (same convention as R2).
 
@@ -751,15 +735,14 @@ def apply_action_expert_r2(onnx_model: onnx.ModelProto) -> tuple[int, int]:
     """
     Apply the R2 compensation to the action expert, in place.
 
-    Pairs with `apply_backbone_rotations(..., enable_r2=True)`: the backbone
-    hands this expert per-layer V caches already rotated by R2, so o_proj must
-    absorb the inverse. Its own v_proj_sha must be rotated to match, because
-    SHAGemmaExpertAttention concatenates the prefix v_cache with its own
-    v_proj_sha output *before* attention -- rotating o_proj alone would
-    un-rotate both halves and corrupt the suffix.
-
-    Uses the same axis conventions as AIMET's R2RotationPass (V on the writing
-    axis, o_proj on the reading axis), so the two cancel exactly.
+    - Pairs with `apply_backbone_rotations(..., enable_r2=True)`
+    - Pi05 exports rotated llm backbone KV as a per-layer cache to action expert
+    - Action expert's own v_proj_sha must be rotated to match
+    - SHAGemmaExpertAttention concats [prefix v_cache, own v_proj_sha output]
+    - R2.T is fused into o_proj to un-rotate concatenated V.
+    - R2 backbone and its action expert must be built and served as a pair. 
+    - Uses the same axis conventions as AIMET's R2RotationPass 
+    (V on the writing axis, o_proj on the reading axis)
 
     Parameters
     ----------
@@ -973,8 +956,8 @@ def _r1_expert_forward(
     adarms_cond: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Replacement for Pi05ActionExpert.expert_forward, bound onto an R1-rotated
-    expert instance by apply_action_expert_r1.
+    Replacement for Pi05ActionExpert.expert_forward, 
+    bound to R1-rotated expert instance by apply_action_expert_r1.
 
     Identical to the original except the two gated-residual-add lines rotate
     the (unrotated-basis) gated sublayer output into the rotated
@@ -1039,59 +1022,50 @@ def _r1_expert_forward(
 
 def apply_action_expert_r1(expert: torch.nn.Module, num_action_steps: int) -> None:
     """
-    Fold an independent R1 rotation into the action expert's own residual
-    stream, in place.
+    Fold R1 into the action expert's own residual stream.
 
-    Unlike apply_action_expert_r2 (which rotates already-exported ONNX
-    initializers), this operates on the PyTorch module *before* export,
-    because AdaRMSNorm's scale/shift/gate modulation is a genuine runtime
-    computation (a function of adarms_cond, which is itself a live input to
-    the exported graph -- the action expert's single ONNX graph is called
-    once per Euler integration step with a different runtime time_step, not
-    exported once per step; see app.py's inference loop). A purely static
-    fold -- the kind backbone R1 and R2 compensation both are -- isn't
-    possible here. Instead: the read/write linears that only depend on the
-    rotated residual stream get a zero-added-cost static fold (identical in
-    spirit to the backbone's), and a small, *localized* online rotation is
-    paid only at the three AdaRMS norm calls per layer plus the two
-    gated-residual-add sites -- not a rotation of every block, and no
-    backbone/expert cache coupling the way R2 needs.
+    - Unlike apply_action_expert_r2 (which overwrites ONNX initializers), 
+    this operates on the PyTorch module *before* export
+    
+    - The action expert has AdaRMSNorm layers--
+      their scale/shift/gate values are computed on the fly from adarms_cond, 
+      a value that's different every time the graph runs 
+      (a single exported graph gets called once per step, each with a different time_step). 
+      You can't pre-bake a rotation into something that's recomputed at runtime, 
+      so a static fold (ex. backbone R1/R2) isn't possible for whatever touches those norms.
+    
+    - Most layers (q_proj_sha, k_proj_sha, v_proj_sha, mlp.gate_proj, mlp.up_proj, action_in_proj) 
+    bake R1 into weight matrix ahead of time.
+    -  The 3 AdaRMSNorm calls per layer, 
+    and the 2 places where a gated result gets added back into the residual stream 
+    # ! There are real, on-device rotation matmuls still happening at specific points
+    - Unlike R2, which requires (backbone - action expert) to be rotated as a matched pair 
+    this R1 rotation is self-contained within the action expert. 
+    - NOTE NOT YET verified against the real checkpoint
 
-    Verified algebraically on synthetic random tensors reproducing this exact
-    structure (GemmaRMSNorm's adaptive math, split per-head Q/K/V, gated
-    residual adds): final output matches an unrotated float baseline to
-    ~1e-13 (float64). NOT YET verified against the real checkpoint -- run the
-    debug command in this repo's PR/session notes (forward-pass diff, float,
-    no quantization) before trusting this against real weights.
-
-    Convention (R1 orthogonal, hidden_size x hidden_size, independent of and
-    unrelated to the backbone's own R1):
-      - "Reading" layers (consume the rotated residual stream; output must be
-        numerically unchanged): W_new = W_old @ R1. Applies to q_proj_sha,
-        k_proj_sha, v_proj_sha (every head) and mlp.gate_proj / mlp.up_proj.
-      - "Writing" layer that feeds the residual stream from a stream-external
-        input with no gate involved: W_new = R1.T @ W_old. Applies only to
-        action_in_proj.
-      - o_proj and mlp.down_proj are left UNMODIFIED: their output is
-        elementwise-gated by a runtime `gate` tensor before being added to the
-        residual stream, and gate can neither be folded into a static weight
-        (it depends on adarms_cond at runtime) nor commuted past a rotation
-        (it's only meaningful in the original, unrotated basis). Instead,
-        _r1_expert_forward applies gate where o_proj/mlp.down_proj already
-        produce output (unrotated), then rotates the *gated* result before
-        the residual add.
-      - action_out_proj is left UNMODIFIED: it's fed the deliberately
-        unrotated output of the final norm (see _r1_expert_forward), so there
-        is no downstream basis for it to match.
+    - Convention:
+      - "Reading" layers (q_proj_sha, k_proj_sha, v_proj_sha, mlp.gate_proj, mlp.up_proj)
+        consume the rotated residual stream; `W_new = W_old @ R1`.
+      - "Writing" layer (action_in_proj) 
+        produces something that gets added into the rotated stream
+        it needs to apply the rotation on the external input so it lands correctly 
+        in the rotated stream's coordinate system: `W_new = R1.T @ W_old`.
+      - UNMODIFIED (o_proj & mlp.down_proj): 
+        their output are gated before being added to the residual stream,
+        and gate can neither be folded into a static weight (runtime adams_cond)
+        Instead, _r1_expert_forward gates original unrotated numbers,
+        and then rotates the *gated* result beforethe residual add.
+      - UNMODIFIED (action_out_proj): Unrotated as it is the last layer. 
 
     Parameters
     ----------
     expert
-        A Pi05ActionExpert instance, already built from a checkpoint. Mutated
-        in place: reading-layer weights are rotated, the three AdaRMSNorm
-        modules are wrapped, and expert_forward is replaced with an R1-aware
-        version bound to this instance only (other instances / the class
-        itself are untouched).
+        A Pi05ActionExpert instance, already built from a checkpoint. 
+        Mutates in place: 
+            - reading-layer weights are rotated, 
+            - the three AdaRMSNorm modules are wrapped, 
+            - and expert_forward is replaced with an R1-aware version bound to this instance only 
+            (other instances / the class itself are untouched).
     num_action_steps
         Number of trailing suffix positions expert_forward slices out after
         the final norm (NUM_ACTION_STEPS in qai_hub_models.models.pi05.model).
