@@ -25,6 +25,9 @@ Usage (from the ai-hub-models repo root):
     # float baseline (same client, different server):
     conda run -n qc python experiments/libero/pi05_libero_server.py \
         --precision float --device cuda --port 23908 --gripper-mode direct
+
+--precision: quantized vs float 
+--component-precision: actual bitwidth precision to quantize
 """
 
 from __future__ import annotations
@@ -41,8 +44,13 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pi05 import make_pi05_pre_post_processors
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
+from qai_hub_models import Precision
 from qai_hub_models.models.pi05.app import Pi05App, Pi05AppConfig
-from qai_hub_models.models.pi05.model import Pi05Collection, Pi05CollectionQuantized
+from qai_hub_models.models.pi05.model import (
+    DEFAULT_COMPONENT_PRECISION,
+    Pi05Collection,
+    Pi05CollectionQuantized,
+)
 from qai_hub_models.models.pi05.spinquant_r1 import read_rotation_marker
 
 # Make the local `deploy` package importable (websocket server + msgpack).
@@ -56,6 +64,10 @@ logger = logging.getLogger("pi05_server")
 
 HF_MODEL_ID = "lerobot/pi05_libero_finetuned"
 DATASET_REPO_ID = "HuggingFaceVLA/libero"
+
+_DEFAULT_PRECISION_HELP = ", ".join(
+    f"{name}={precision}" for name, precision in DEFAULT_COMPONENT_PRECISION.items()
+)
 
 # pi05 camera keys (from config.input_features); the app ignores "empty_camera_0".
 KEY_PRIMARY = "observation.images.image"  # agentview / base camera
@@ -163,7 +175,34 @@ def describe_rotations(checkpoint: str) -> dict[str, bool]:
     }
 
 
-def build_app(precision: str, checkpoint: str, device: str):
+def parse_component_precision(pairs: list[str] | None) -> dict[str, Precision]:
+    """Parse ``--component-precision backbone=w4a8 ...`` into a Precision map.
+
+    """
+    parsed: dict[str, Precision] = {}
+    for pair in pairs or []:
+        name, sep, value = pair.partition("=")
+        if not sep:
+            raise ValueError(
+                f"--component-precision expects NAME=PRECISION, got {pair!r} "
+                "(e.g. backbone=w4a8)."
+            )
+        name = name.strip()
+        if name not in DEFAULT_COMPONENT_PRECISION:
+            raise ValueError(
+                f"Unknown component {name!r} in --component-precision. "
+                f"Quantizable components: {sorted(DEFAULT_COMPONENT_PRECISION)}."
+            )
+        parsed[name] = Precision.parse(value.strip())
+    return parsed
+
+
+def build_app(
+    precision: str,
+    checkpoint: str,
+    device: str,
+    component_precision: dict[str, Precision] | None = None,
+):
     logger.info("Loading PI05 policy (config/tokenizer) from %s ...", HF_MODEL_ID)
     policy = PI05Policy.from_pretrained(HF_MODEL_ID).to(device).eval()
 
@@ -181,18 +220,33 @@ def build_app(precision: str, checkpoint: str, device: str):
             rotations["r1"],
             rotations["r2"],
         )
+        if component_precision:
+            logger.info(
+                "Component precision overrides: %s",
+                {name: str(p) for name, p in component_precision.items()},
+            )
+        # Pass only the overrides: --component-precision overrides ckpt's markers.
         collection = Pi05CollectionQuantized.from_pretrained(
-            checkpoint=checkpoint, host_device=device
+            checkpoint=checkpoint,
+            host_device=device,
+            component_precision=component_precision or None,
         )
+        precision_info = {
+            name: str(component._precision)
+            for name, component in collection.components.items()
+            if hasattr(component, "_precision")
+        }
+        logger.info("Component precision in use: %s", precision_info)
     else:
         collection = Pi05Collection.from_pretrained(host_device=device)
+        precision_info = None
 
     app = Pi05App(
         config=Pi05AppConfig.from_policy(policy),
         **collection.components,
     ).eval()
     logger.info("Pi05App ready. image_keys=%s", app.image_keys)
-    return app, preprocessor, postprocessor
+    return app, preprocessor, postprocessor, precision_info
 
 
 def main() -> None:
@@ -200,6 +254,17 @@ def main() -> None:
     ap.add_argument("--precision", choices=["quantized", "float"], default="quantized")
     ap.add_argument(
         "--checkpoint", default="/home/jk656/ai-hub-models/build/pi05_mixed"
+    )
+    ap.add_argument(
+        "--component-precision",
+        nargs="+",
+        metavar="NAME=PRECISION",
+        default=None,
+        help=(
+            "Override component's precision, e.g. 'backbone=w4a8'."
+            "Not normally needed: quantize.py reads each component's"
+            "precision in the ckpt and that is used automatically."
+        ),
     )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--host", default="0.0.0.0")
@@ -236,8 +301,15 @@ def main() -> None:
             "table, backbone) and detected from its markers."
         )
 
-    app, preprocessor, postprocessor = build_app(
-        args.precision, args.checkpoint, args.device
+    component_precision = parse_component_precision(args.component_precision)
+    if component_precision and args.precision != "quantized":
+        logger.warning(
+            "--component-precision is ignored with --precision float (no "
+            "QuantSim is built)."
+        )
+
+    app, preprocessor, postprocessor, precision_info = build_app(
+        args.precision, args.checkpoint, args.device, component_precision
     )
     policy_server_impl = Pi05InferenceServer(
         app=app,
@@ -257,6 +329,7 @@ def main() -> None:
             "model": "pi05",
             "precision": args.precision,
             "checkpoint": args.checkpoint if args.precision == "quantized" else "float",
+            "component_precision": precision_info,
             "spinquant": (
                 describe_rotations(args.checkpoint)
                 if args.precision == "quantized"

@@ -9,6 +9,7 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
@@ -17,6 +18,7 @@ import numpy as np
 import onnxruntime
 import torch
 from aimet_onnx.common.defs import QuantScheme
+from aimet_onnx.qc_quantize_op import _EncodingMismatchInfo
 from aimet_onnx.quantsim import QuantizationSimModel as QuantSimOnnx
 from aimet_onnx.quantsim import load_encodings_to_sim
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -87,6 +89,7 @@ from qai_hub_models.utils.qai_hub_helpers import (
     export_torch_to_onnx_zip,
 )
 from qai_hub_models.utils.quantization_aimet_onnx import (
+    AIMET_SUPPORTED_PRECISIONS,
     AIMETOnnxQuantizableMixin,
     aimet_quant_types,
 )
@@ -94,6 +97,98 @@ from qai_hub_models.utils.quantization_aimet_onnx import (
 MODEL_ID = __name__.split(".")[-2]
 MODEL_ASSET_VERSION = 2
 _PI05_AIMET_CONFIG = str(Path(__file__).parent / "aimet_config.json")
+
+# DEFAULAT_COMPONENT_PRECISION
+DEFAULT_COMPONENT_PRECISION: dict[str, Precision] = {
+    "vision_encoder": Precision.w8a16,
+    "backbone": Precision.w4a16,
+    "action_expert": Precision.w8a16,
+}
+# Written for each component by quantize.py
+PRECISION_MARKER = "precision.json"
+
+
+def write_precision_marker(component_dir: str | Path, precision: Precision) -> Path:
+    """Record the precision a component's encodings were calibrated at."""
+    path = Path(component_dir) / PRECISION_MARKER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"precision": str(precision)}, indent=2) + "\n")
+    return path
+
+
+def read_precision_marker(component_dir: str | Path) -> Precision | None:
+    """
+    Return the precision a component was calibrated at, or None if unrecorded.
+
+    None means the checkpoint predates precision tracking;
+    the caller falls back to DEFAULT_COMPONENT_PRECISION
+    """
+    path = Path(component_dir) / PRECISION_MARKER
+    if not path.is_file():
+        return None
+    recorded = json.loads(path.read_text()).get("precision")
+    if not recorded:
+        return None
+    return Precision.parse(recorded)
+
+
+def _resolve_component_precision(
+    component_precision: Precision | Mapping[str, Precision] | str | None,
+    recorded: Mapping[str, Precision] | None = None,
+) -> dict[str, Precision]:
+    """Component_precision argument to one Precision per component.
+
+    Three layers, each overriding the one before: 
+    - DEFAULT_COMPONENT_PRECISION,
+    - then ``recorded`` (ckpt's precision markers),
+    - then the explicit ``component_precision`` argument.
+
+    Raises ValueError for an unknown component name, or for a precision
+    aimet_quant_types would silently turn into something else -- notably
+    Precision.mixed, which describes the collection as a whole rather than any
+    one component and is what this map already expresses.
+    """
+    base = {**DEFAULT_COMPONENT_PRECISION, **(recorded or {})}
+
+    if component_precision is None:
+        resolved = base
+    elif isinstance(component_precision, (Precision, str)):
+        resolved = dict.fromkeys(base, Precision.parse(component_precision))
+    else:
+        unknown = sorted(set(component_precision) - set(DEFAULT_COMPONENT_PRECISION))
+        if unknown:
+            raise ValueError(
+                f"Unknown component(s) in component_precision: {unknown}. "
+                f"Quantizable components are {sorted(DEFAULT_COMPONENT_PRECISION)} "
+                "(token_emb has no quantized artifact, so it takes no precision)."
+            )
+        resolved = {
+            **base,
+            **{name: Precision.parse(p) for name, p in component_precision.items()},
+        }
+
+    for name, p in resolved.items():
+        marked = (recorded or {}).get(name)
+        if marked is not None and marked != p:
+            print(
+                f"WARNING: loading {name} at {p}, but its checkpoint records "
+                f"{marked}. Unless you are deliberately overriding, drop "
+                "the explicit component_precision and let the marker decide."
+            )
+
+    unsupported = {
+        name: p for name, p in resolved.items() if p not in AIMET_SUPPORTED_PRECISIONS
+    }
+    if unsupported:
+        offending = ", ".join(f"{name}={p}" for name, p in sorted(unsupported.items()))
+        supported = ", ".join(sorted(str(p) for p in AIMET_SUPPORTED_PRECISIONS))
+        raise ValueError(
+            "component_precision must name a per-component precision AIMET can "
+            f"build, got {offending}. Supported: {supported}. Precision.mixed "
+            "describes the whole collection, not a component -- leave "
+            "component_precision unset to get the per-component defaults."
+        )
+    return resolved
 
 
 def _drop_unloadable_encodings(quant_sim: QuantSimOnnx, encodings: dict) -> set[str]:
@@ -130,22 +225,67 @@ def _drop_unloadable_encodings(quant_sim: QuantSimOnnx, encodings: dict) -> set[
     return dropped
 
 
+def _format_encoding_mismatch(info: _EncodingMismatchInfo) -> str:
+    """Render one AIMET mismatch record as ``<tensor>: <field> sim=x encodings=y``."""
+    fields = {
+        "enabled": info.enabled_mismatch,
+        "dtype": info.dtype_mismatch,
+        "bitwidth": info.bitwidth_mismatch,
+        "symmetric": info.is_symmetric_mismatch,
+        "strict_symmetric": info.is_strict_symmetric_mismatch,
+        "unsigned_symmetric": info.is_unsigned_symmetric_mismatch,
+        "enc_type": info.enc_type_mismatch,
+    }
+    detail = ", ".join(
+        f"{name} sim={pair[0]} encodings={pair[1]}"
+        for name, pair in fields.items()
+        if pair is not None
+    )
+    return f"{info.quantizer_name}: {detail}"
+
+
+def _is_benign_encoding_mismatch(info: _EncodingMismatchInfo) -> bool:
+    """True for the one disagreement that is resolved correctly by the load.
+
+    ``enabled_mismatch == (False, True)`` means the sim had no (or a disabled)
+    quantizer for a tensor the checkpoint has an encoding for. With
+    ``strict=False`` AIMET creates/enables that quantizer and loads the encoding
+    into it (``_add_missing_quantizers``, then ``_load_encodings_dict``, which
+    ends with ``self.enabled = True``), so nothing runs unquantized. This is the
+    expected outcome for the memory-op encodings ``apply_propagate_memory_encodings``
+    writes, which ``_drop_unloadable_encodings`` deliberately keeps.
+
+    Every other mismatch is a real disagreement between the sim's configuration
+    and the checkpoint's -- see _load_bundle_encodings.
+    """
+    return (
+        info.enabled_mismatch == (False, True)
+        and info.dtype_mismatch is None
+        and info.bitwidth_mismatch is None
+        and info.is_symmetric_mismatch is None
+        and info.is_strict_symmetric_mismatch is None
+        and info.is_unsigned_symmetric_mismatch is None
+        and info.enc_type_mismatch is None
+    )
+
+
 def _load_bundle_encodings(quant_sim: QuantSimOnnx, bundle: ONNXBundle) -> None:
     """Load a calibrated checkpoint's encodings into a freshly built QuantSim.
 
-    Without this the sim keeps its constructor defaults: activation quantizers
-    sit in ``updateStats`` (they pass tensors through unquantized) and weight
-    quantizers recompute plain min-max on every run, discarding whatever
-    seqMSE/AdaScale produced during calibration. Only the export path reads the
-    encodings file; the local run path needs this.
+    Without this the sim keeps its constructor defaults: 
+    - activation quantizers sit in ``updateStats`` and pass unquantized tensors
+    - weight quantizers recompute plain min-max, discarding calibrated seqMSE.
 
-    Must be called *after* any bitwidth overrides (``_set_matmul_second_input_to_8b``,
-    ``_set_tensors_to_output_8b_sym``) -- ``strict=False`` silently skips an
-    encoding whose bitwidth disagrees with its quantizer.
+    Must be called *after* any bitwidth overrides 
+    (``_set_matmul_second_input_to_8b``,``_set_tensors_to_output_8b_sym``)
+
+    Manually raise RuntimeError if ckpt doesn't match sim settings. 
+    ``strict=False`` is required, but mismatches are **logged** instead of failing: 
+    - a quantizer with no encoding is silently disabled and runs in float, 
+    - a bitwidth disagreement is silently resolved in the encodings' favour.
     """
     if bundle.aimet_encodings_path is None:
-        # Uncalibrated source (DEFAULT_UNQUANTIZED / fresh torch export). The
-        # sim is about to be calibrated by quantize.py, so there is nothing to load.
+        # Uncalibrated source (DEFAULT_UNQUANTIZED). 
         return
 
     with open(bundle.aimet_encodings_path) as f:
@@ -163,17 +303,39 @@ def _load_bundle_encodings(quant_sim: QuantSimOnnx, bundle: ONNXBundle) -> None:
             f"{sorted(dropped)[:5]}{' ...' if len(dropped) > 5 else ''}"
         )
 
-    load_encodings_to_sim(quant_sim, encodings, strict=False)
+    mismatches = load_encodings_to_sim(quant_sim, encodings, strict=False)
+
+    problems = [
+        _format_encoding_mismatch(m)
+        for m in mismatches
+        if not _is_benign_encoding_mismatch(m)
+    ]
 
     loaded = sum(1 for q in quant_sim.qc_quantize_op_dict.values() if q.get_encodings())
     enabled = sum(1 for q in quant_sim.qc_quantize_op_dict.values() if q.enabled)
     if loaded < enabled:
-        # strict=False turns a name/bitwidth mismatch into a silently skipped
-        # quantizer, which reads as "quantized" but runs partly in float.
-        print(
-            f"WARNING: loaded encodings for {loaded}/{enabled} enabled quantizers "
-            f"from {bundle.aimet_encodings_path}. The remainder will run unquantized."
+        problems.append(
+            f"{enabled - loaded} of {enabled} enabled quantizers received no "
+            "encoding and would run unquantized"
         )
+
+    if not problems:
+        return
+
+    shown = sorted(problems)[:10]
+    message = (
+        f"{len(problems)} quantizer(s) disagree with the encodings in "
+        f"{bundle.aimet_encodings_path}.\n"
+        "The QuantSim was built with a different configuration than the "
+        "checkpoint was calibrated with. The usual cause is precision:"
+        f"The resulting sim is partly unquantized or quantized at a "
+        "precision you did not ask for, so any accuracy measured from it is "
+        "not the checkpoint's.\n" + "\n".join(f"  {p}" for p in shown)
+    )
+    if len(problems) > len(shown):
+        message += f"\n  ... and {len(problems) - len(shown)} more"
+
+    raise RuntimeError(message)
 
 
 MAX_TOKEN_LENGTH = 200  # 48 for pi0, 200 for pi05
@@ -1691,16 +1853,8 @@ class Pi05PaliGemmaBackboneQuantizable(
 
         onnx_model = self._onnx_bundle.load_onnx_model()
         if self._use_spinquant_r1:
-            # Must run on the float model before QuantSimOnnx is built, so
-            # the quantizer scales computed below are calibrated on the
-            # rotated weights. See spinquant_r1.py for why this only
-            # rotates the backbone's internal weights, not an embedding,
-            # and for why R2/R3 additionally require a compensating action
-            # expert (apply_action_expert_r2 / apply_action_expert_r3). R4 is
-            # backbone-local (no action-expert counterpart), but is still
-            # passed explicitly rather than relying on enable_r4's
-            # follow-enable_r1 default, so it's independently controllable
-            # like R2/R3.
+            # Run on the float model before QuantSimOnnx is built, so
+            # the quantizer scales are calibrated on rotated weights.
             apply_backbone_rotations(
                 onnx_model,
                 enable_r2=self._use_spinquant_r2,
@@ -1819,20 +1973,15 @@ class Pi05ActionExpertQuantizable(
 
         onnx_model = self._onnx_bundle.load_onnx_model()
         if self._use_spinquant_r2:
-            # Compensates the R2 rotation baked into the backbone's exported V
-            # caches. Must run on the float model before QuantSimOnnx is built,
-            # so scales are calibrated on the rotated weights. Only valid
-            # against an R2 backbone -- see spinquant_r1.py.
+            # Compensates the R2 baked into the backbone's exported V caches.
+            # Not independent from backbone (and vice versa).
             apply_action_expert_r2(onnx_model)
         if self._use_spinquant_r4:
-            # Backbone-independent (nothing crosses the component boundary),
-            # but ordered like the backbone's R4: after the weight-only R2
-            # above, before the node-inserting R3 below. See spinquant_r1.py.
+            # Independent from backbone (and vice versa)
             apply_action_expert_r4(onnx_model)
         if self._use_spinquant_r3:
-            # Compensates the R3 rotation baked into the backbone's exported K
-            # caches; same ordering/calibration reasoning as R2 above. Only
-            # valid against an R3 backbone -- see spinquant_r1.py.
+            # Compensates the R3 baked into the backbone's exported K caches;
+            # Not independent from backbone (and vice versa).
             apply_action_expert_r3(onnx_model)
         quant_sim = QuantSimOnnx(
             model=onnx_model,
@@ -2223,9 +2372,19 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
         cls,
         checkpoint: str = "DEFAULT",
         host_device: torch.device | str = torch.device("cpu"),
+        component_precision: Precision | Mapping[str, Precision] | str | None = None,
     ) -> Pi05CollectionQuantized:
         """
         Load a calibrated checkpoint.
+
+        - Each component's QuantSim has to be rebuilt at the precision its
+            encodings were calibrated at, or _load_bundle_encodings rejects them.
+        - ckpts record a component's PRECISION_MARKER, which is loaded automatically
+        - ``component_precision`` overrides what a marker says. 
+
+        Deliberately not named ``precision``: 
+        the export pipelines pass model-wide precision (Precision.mixed)
+        to every from_pretrained parameter of that name -- see get_model_kwargs
 
         Rotations are never (re-)applied here. A checkpoint written by
         quantize.py already has them baked into its saved weights, so the
@@ -2239,6 +2398,19 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
         vision_ckpt = root / Pi05PaliGemmaVisionQuantizable.default_subfolder
         backbone_ckpt = root / Pi05PaliGemmaBackboneQuantizable.default_subfolder
         expert_ckpt = root / Pi05ActionExpertQuantizable.default_subfolder
+
+        recorded_precision = {
+            name: marked
+            for name, component_dir in (
+                ("vision_encoder", vision_ckpt),
+                ("backbone", backbone_ckpt),
+                ("action_expert", expert_ckpt),
+            )
+            if (marked := read_precision_marker(component_dir)) is not None
+        }
+        resolved_precision = _resolve_component_precision(
+            component_precision, recorded_precision
+        )
 
         # R2 couples backbone and expert: the backbone exports V caches rotated
         # by R2 and the expert's o_proj absorbs the inverse. Mixing an R2
@@ -2285,17 +2457,24 @@ class Pi05CollectionQuantized(_Pi05LiberoCalibrationMixin, WorkbenchModelCollect
 
         return cls(
             Pi05PaliGemmaVisionQuantizable.from_pretrained(
-                checkpoint=checkpoint, host_device=host_device
+                checkpoint=checkpoint,
+                host_device=host_device,
+                precision=resolved_precision["vision_encoder"],
             ),
+            # token_emb has no quantized artifact, so it takes no precision.
             Pi05PaliGemmaTokenEmbed.from_pretrained(
                 checkpoint=checkpoint,
                 host_device=host_device,
                 cls_kwargs={"use_spinquant_r1": embed_r1},
             ),
             Pi05ActionExpertQuantizable.from_pretrained(
-                checkpoint=checkpoint, host_device=host_device
+                checkpoint=checkpoint,
+                host_device=host_device,
+                precision=resolved_precision["action_expert"],
             ),
             Pi05PaliGemmaBackboneQuantizable.from_pretrained(
-                checkpoint=checkpoint, host_device=host_device
+                checkpoint=checkpoint,
+                host_device=host_device,
+                precision=resolved_precision["backbone"],
             ),
         )

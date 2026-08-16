@@ -4,15 +4,15 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Evaluate Qualcomm AI Hub pi05 (quantized `build/pi05_mixed` or float) on the
-# LIBERO closed-loop benchmark, reusing the FastWAM model-agnostic websocket
-# client (fastwam_libero_client.py) + `libero` conda env.
+# Evaluate Qualcomm AI Hub pi05 on the LIBERO closed-loop benchmark,
+# * Reference: FastWAM model-agnostic websocket client
+# (fastwam_libero_client.py) + `libero` conda env.
 #
-# Architecture (two repos + two envs, one box, decoupled over a websocket):
+# Architecture:
 #   * pi05 policy server  -> ai-hub-models, `qc`     env (qai_hub_models + aimet_onnx + lerobot)
 #   * LIBERO sim client   -> FastWAM,       `libero` env (mujoco/robosuite rollouts)
-# The server (pi05_libero_server.py) is local to this repo; the client lives in
-# FastWAM, located via FASTWAM_REPO (default /home/jk656/FastWAM-jk).
+# The server (pi05_libero_server.py) is local to this repo;
+# the client lives in FastWAM, located via FASTWAM_REPO (/home/jk656/FastWAM-jk).
 # This script launches the server, waits until it is serving, runs the client,
 # and always tears the server down on exit.
 #
@@ -29,11 +29,18 @@
 # Everything else is overridable via env vars (defaults in the CONFIG block):
 #   SERVER_GPU PORT NUM_STEPS GRIPPER_MODE CHECKPOINT OUT_ROOT
 #   QAIHM_REPO FASTWAM_REPO CONDA_QC CONDA_LIBERO REPLAN_STEPS NUM_STEPS_WAIT
-#   SAVE_VIDEO READY_TIMEOUT CLIENT_GPU SPINQUANT_R1
+#   SAVE_VIDEO READY_TIMEOUT CLIENT_GPU SPINQUANT_R1 COMPONENT_PRECISION
+
 #
 #   SPINQUANT_R1=1 passes --use-spinquant-r1 to the server (quantized only).
 #   Must match how the backbone in CHECKPOINT was quantized -- see
 #   quantize.py --use-spinquant-r1.
+#
+#   COMPONENT_PRECISION: List of NAME=PRECISION forwarded to the server.
+#   Normally quantize.py records/loads each component's precision in the ckpt.
+#   Set it to override a marker-- those fall back to DEFAULT_COMPONENT_PRECISION
+
+#   PRECISION: quantized vs. float; irrelevant to actual bitwidth. 
 #
 # EXAMPLES
 #   # Smoke test (validated): quantized, 1 task x 5 episodes on libero_object
@@ -75,6 +82,7 @@ SAVE_VIDEO="${SAVE_VIDEO:-0}"        # 1 -> pass --save-video (default off; set 
 READY_TIMEOUT="${READY_TIMEOUT:-600}"    # seconds to wait for server load
 OUT_ROOT="${OUT_ROOT:-${FASTWAM_REPO}/outputs/pi05_libero}"
 SPINQUANT_R1="${SPINQUANT_R1:-0}"    # 1 -> pass --use-spinquant-r1 to the server
+COMPONENT_PRECISION="${COMPONENT_PRECISION:-}"   # e.g. "backbone=w4a8" (see header)
 
 SERVER_PY="${SCRIPT_DIR}/pi05_libero_server.py"    # local (this repo, qc env)
 CLIENT_PY="${SCRIPT_DIR}/fastwam_libero_client.py" # local (this repo, libero env) -- model-agnostic
@@ -118,6 +126,7 @@ run_one() {
   echo "=================================================================="
   echo "[run] precision=${prec}  suite=${SUITE}  test_num=${TEST_NUM}  task_range='${TASK_RANGE}'"
   echo "[run] server_gpu=${SERVER_GPU}  port=${PORT}  num_steps=${NUM_STEPS}  gripper=${GRIPPER_MODE}  spinquant_r1=${SPINQUANT_R1}"
+  echo "[run] component_precision='${COMPONENT_PRECISION:-<defaults>}'"
   echo "[run] out_dir=${out_dir}  server_log=${server_log}"
   echo "=================================================================="
 
@@ -131,6 +140,13 @@ run_one() {
     --gripper-mode "${GRIPPER_MODE}"
   )
   [[ "${SPINQUANT_R1}" == "1" ]] && server_args+=(--use-spinquant-r1)
+
+  # Only for the quantized run -- a list of NAME=PRECISION.
+  if [[ "${prec}" == "quantized" && -n "${COMPONENT_PRECISION// }" ]]; then
+    # shellcheck disable=SC2206
+    local cp=(${COMPONENT_PRECISION})
+    server_args+=(--component-precision "${cp[@]}")
+  fi
 
   PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="${SERVER_GPU}" \
     conda run --no-capture-output -n "${CONDA_QC}" python "${SERVER_PY}" \

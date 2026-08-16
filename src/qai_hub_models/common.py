@@ -793,9 +793,12 @@ class Precision:
     # Common Precision Instances
     float: Precision
     w8a8: Precision
+    w8a4: Precision
     w8a16: Precision
     w16a16: Precision
     w4a16: Precision
+    w4a8: Precision
+    w4a4: Precision
     w4: Precision
 
     # Mixed Precision Instances
@@ -1091,9 +1094,12 @@ class Precision:
 
 Precision.float = Precision(None, None)
 Precision.w8a8 = Precision(QuantizeDtype.INT8, QuantizeDtype.INT8)
+Precision.w8a4 = Precision(QuantizeDtype.INT8, QuantizeDtype.INT4)
 Precision.w8a16 = Precision(QuantizeDtype.INT8, QuantizeDtype.INT16)
 Precision.w16a16 = Precision(QuantizeDtype.INT16, QuantizeDtype.INT16)
 Precision.w4a16 = Precision(QuantizeDtype.INT4, QuantizeDtype.INT16)
+Precision.w4a8 = Precision(QuantizeDtype.INT4, QuantizeDtype.INT8)
+Precision.w4a4 = Precision(QuantizeDtype.INT4, QuantizeDtype.INT4)
 Precision.w4 = Precision(QuantizeDtype.INT4, None)
 Precision.w8a8_mixed_int16 = Precision(
     QuantizeDtype.INT8, QuantizeDtype.INT8, QuantizeDtype.INT16

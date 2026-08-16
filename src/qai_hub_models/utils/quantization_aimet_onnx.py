@@ -49,6 +49,28 @@ DEFAULT_SEQ_MSE_NUM_SAMPLES = 20
 DEFAULT_ADA_SCALE_NUM_SAMPLES = 128
 DEFAULT_ADA_SCALE_NUM_ITERATIONS = 512
 
+# Param/activation precision, used by aimet_quant_types below.
+_PARAM_MAP: dict[Precision, Any] = {
+    Precision.w8a16: aimet_onnx.int8,
+    Precision.w8a8: aimet_onnx.int8,
+    Precision.w8a4: aimet_onnx.int8,
+    Precision.w4a16: aimet_onnx.int4,
+    Precision.w4a8: aimet_onnx.int4,
+    Precision.w4a4: aimet_onnx.int4,
+}
+_ACT_MAP: dict[Precision, Any] = {
+    Precision.w8a16: aimet_onnx.int16,
+    Precision.w8a8: aimet_onnx.int8,
+    Precision.w8a4: aimet_onnx.int4,
+    Precision.w4a16: aimet_onnx.int16,
+    Precision.w4a8: aimet_onnx.int8,
+    Precision.w4a4: aimet_onnx.int4,
+}
+
+# Precisions aimet_quant_types has a real mapping for. Anything else falls back
+# to int8/int8 silently, so callers should validate against this set first.
+AIMET_SUPPORTED_PRECISIONS: frozenset[Precision] = frozenset(_PARAM_MAP)
+
 
 def ensure_aimet_onnx_installed(
     expected_version: str | None = None, model_id: str | None = None
@@ -92,19 +114,10 @@ def ensure_min_aimet_onnx_version(
 
 
 def aimet_quant_types(precision: Precision) -> tuple[Any, Any]:
-    """Return (param_quantize_type, activation_quantize_type) for the given precision."""
-    import aimet_onnx
+    """Return (param_quantize_type, activation_quantize_type) for the given precision.
 
-    _PARAM_MAP = {
-        Precision.w8a16: aimet_onnx.int8,
-        Precision.w8a8: aimet_onnx.int8,
-        Precision.w4a16: aimet_onnx.int4,
-    }
-    _ACT_MAP = {
-        Precision.w8a16: aimet_onnx.int16,
-        Precision.w8a8: aimet_onnx.int8,
-        Precision.w4a16: aimet_onnx.int16,
-    }
+    Precisions outside AIMET_SUPPORTED_PRECISIONS fall back to int8/int8.
+    """
     return _PARAM_MAP.get(precision, aimet_onnx.int8), _ACT_MAP.get(
         precision, aimet_onnx.int8
     )

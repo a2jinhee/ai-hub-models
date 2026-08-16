@@ -77,23 +77,17 @@ import torch
 from qai_hub_models import Precision
 from qai_hub_models.models.pi05.app import Pi05App
 from qai_hub_models.models.pi05.model import (
+    DEFAULT_COMPONENT_PRECISION,
     MODEL_ID,
     Pi05ActionExpertQuantizable,
     Pi05Collection,
     Pi05PaliGemmaBackboneQuantizable,
     Pi05PaliGemmaVisionQuantizable,
+    write_precision_marker,
 )
 from qai_hub_models.models.pi05.spinquant_r1 import write_rotation_marker
 from qai_hub_models.utils.dataset_util import dataset_entries_to_dataloader
 from qai_hub_models.utils.quantization_aimet_onnx import DEFAULT_SEQ_MSE_NUM_SAMPLES
-
-# Per-component precision mapping
-MIXED_PRECISION_MAP: dict[str, Precision] = {
-    "vision_encoder": Precision.w8a16,
-    "backbone": Precision.w4a16,
-    "action_expert": Precision.w8a16,
-}
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -124,8 +118,8 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Override the default per-component precision from MIXED_PRECISION_MAP "
-            "(e.g. 'w4a16', 'w8a16'). Defaults to the mixed-precision mapping."
+            "Override DEFAULT_COMPONENT_PRECISION "
+            "vision_encoder (w8a16), backbone (w4a16), action_expert (w8a16)"
         ),
     )
     parser.add_argument(
@@ -231,7 +225,7 @@ def main() -> None:
     precision = (
         Precision.parse(args.precision)
         if args.precision
-        else MIXED_PRECISION_MAP[args.component]
+        else DEFAULT_COMPONENT_PRECISION[args.component]
     )
 
     QCls: type
@@ -299,6 +293,13 @@ def main() -> None:
         r4=args.use_spinquant and args.component in r4_components,
     )
     print(f"Recorded SpinQuant rotations in {marker}")
+
+    # encodings file doesn't record its own precision.
+    # the marker stores precision so that loader doesn't have to guess.
+    precision_marker = write_precision_marker(
+        Path(output_dir) / QCls.default_subfolder, precision
+    )
+    print(f"Recorded precision {precision} in {precision_marker}")
 
 
 if __name__ == "__main__":
