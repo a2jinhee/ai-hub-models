@@ -338,6 +338,38 @@ def _load_bundle_encodings(quant_sim: QuantSimOnnx, bundle: ONNXBundle) -> None:
     raise RuntimeError(message)
 
 
+def _disable_pre_softmax_quantizers(quant_sim: QuantSimOnnx) -> list[str]:
+    """Leave softmax input tensor unquantized (float).
+
+    Additive attention masks use ``big_neg_val = -1e4`` for blocked positions 
+    - ``prefix_att_2d`` in the backbone 
+    - and ``full_att_4d`` in the action expert (see ``embed_prefix``). 
+    Per-tensor min-max on attention logits flattens attention to uniform;
+
+    Returns the tensor names that were disabled.
+    """
+    graph = quant_sim.model.graph()
+    # QuantSimOnnx inserts a QcQuantizeOp per activation and rewires consumers
+    # onto its output ("<tensor>_updated"), while qc_quantize_op_dict stays keyed
+    # by the original tensor name. Map back, or every lookup below misses.
+    qdq_source = {
+        node.output[0]: node.input[0]
+        for node in graph.node
+        if node.op_type == "QcQuantizeOp"
+    }
+
+    disabled = []
+    for node in graph.node:
+        if node.op_type != "Softmax":
+            continue
+        scores = qdq_source.get(node.input[0], node.input[0])
+        quantizer = quant_sim.qc_quantize_op_dict.get(scores)
+        if quantizer is not None and quantizer.enabled:
+            quantizer.enabled = False
+            disabled.append(scores)
+    return disabled
+
+
 MAX_TOKEN_LENGTH = 200  # 48 for pi0, 200 for pi05
 NUM_ACTION_STEPS = 50
 # Set NUM_CAMERAS to override the value in policy (e.g., for profiling
@@ -1870,6 +1902,9 @@ class Pi05PaliGemmaBackboneQuantizable(
             providers=AIMETOnnxQuantizableMixin.get_ort_providers(self.host_device),
         )
         _set_matmul_second_input_to_8b(quant_sim)
+        # Must follow bitwidth override above
+        exempted = _disable_pre_softmax_quantizers(quant_sim)
+        print(f"Left {len(exempted)} pre-softmax tensor(s) in float (additive mask)")
         # After the bitwidth overrides above -- see _load_bundle_encodings.
         _load_bundle_encodings(quant_sim, self._onnx_bundle)
         return quant_sim
@@ -1998,6 +2033,9 @@ class Pi05ActionExpertQuantizable(
         ]
         _set_tensors_to_output_8b_sym(quant_sim, kv_inputs)
         _set_matmul_second_input_to_8b(quant_sim)
+        # Must follow bitwidth override above
+        exempted = _disable_pre_softmax_quantizers(quant_sim)
+        print(f"Left {len(exempted)} pre-softmax tensor(s) in float (additive mask)")
         # After the bitwidth overrides above -- see _load_bundle_encodings.
         _load_bundle_encodings(quant_sim, self._onnx_bundle)
         return quant_sim
