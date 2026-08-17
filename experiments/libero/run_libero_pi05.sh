@@ -91,11 +91,25 @@ mkdir -p "$OUT_ROOT"
 
 # ---- helpers --------------------------------------------------------------
 SERVER_PID=""
+
+port_in_use() { [[ -n "$(ss -ltnH "sport = :${PORT}" 2>/dev/null)" ]]; }
+
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "[run] stopping pi05 server (pid $SERVER_PID)"
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  # SERVER_PID is the `conda run` wrapper, which does NOT forward signals to the
+  # python server it spawns -- the kill above leaves that child alive holding PORT. 
+  # Reap it by port, or the next run's /healthz probe silently latches
+  # onto this stranded server and reports accuracy for the wrong model.
+  # Guarded on SERVER_PID so an aborted run never kills someone else's server.
+  if [[ -n "$SERVER_PID" ]] && port_in_use; then
+    echo "[run] reaping stranded server still holding port ${PORT}"
+    fuser -k -TERM "${PORT}/tcp" >/dev/null 2>&1 || true
+    sleep 2
+    if port_in_use; then fuser -k -KILL "${PORT}/tcp" >/dev/null 2>&1 || true; fi
   fi
 }
 trap cleanup EXIT INT TERM
@@ -129,6 +143,17 @@ run_one() {
   echo "[run] component_precision='${COMPONENT_PRECISION:-<defaults>}'"
   echo "[run] out_dir=${out_dir}  server_log=${server_log}"
   echo "=================================================================="
+
+  # 0) refuse to start on an occupied port. wait_for_server on its owns
+  # cannot tell a leftover one from ours.
+  if port_in_use; then
+    echo "[run] ERROR: port ${PORT} is already in use -- refusing to start."
+    ss -ltnp "sport = :${PORT}" 2>/dev/null || true
+    echo "[run] Likely a server stranded by an interrupted run. Free it with:"
+    echo "[run]     fuser -k ${PORT}/tcp"
+    echo "[run] or run this eval on another port with PORT=<n>."
+    return 1
+  fi
 
   # 1) launch the pi05 policy server (qc env) in the background
   local server_args=(
