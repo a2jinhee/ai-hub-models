@@ -49,6 +49,7 @@ from qai_hub_models.models.pi05.model_adaptation import (
 )
 from qai_hub_models.models.pi05.spinquant_r1 import (
     apply_action_expert_r1,
+    apply_action_expert_r1_online,
     apply_action_expert_r2,
     apply_action_expert_r3,
     apply_action_expert_r4,
@@ -338,19 +339,22 @@ def _load_bundle_encodings(quant_sim: QuantSimOnnx, bundle: ONNXBundle) -> None:
     raise RuntimeError(message)
 
 
-def _disable_softmax_quantizers(quant_sim: QuantSimOnnx) -> list[str]:
-    """Leave both softmax input and output tensors unquantized (float).
+def _disable(quant_sim: QuantSimOnnx, tensor: str, disabled: list[str]) -> None:
+    """Turn off ``tensor``'s quantizer if still enabled, recording it in ``disabled``."""
+    quantizer = quant_sim.qc_quantize_op_dict.get(tensor)
+    if quantizer is not None and quantizer.enabled:
+        quantizer.enabled = False
+        disabled.append(tensor)
 
-    Input: additive attention masks use ``big_neg_val = -1e4`` for blocked
-    positions
-    - ``prefix_att_2d`` in the backbone
-    - and ``full_att_4d`` in the action expert (see ``embed_prefix``).
-    Per-tensor min-max on attention logits flattens attention to uniform;
 
-    Output: a 4-bit grid over [0, 1] has a step of 1/7 -- every weight
-        below 1/14 rounds to zero and attention collapses.
+def _disable_quantizers(
+    quant_sim: QuantSimOnnx,
+) -> tuple[list[str], list[str]]:
+    """Disable quantizers for certain tensors
 
-    Returns the tensor names that were disabled.
+    - Softmax:: its input, its output, and Cast between output and P*V MatMul.
+    - Online Hadamard rotations (expert R1, R3, R4):: the node's activation input.
+    - Returns the disabled tensor names.
     """
     graph = quant_sim.model.graph()
     # QuantSimOnnx inserts a QcQuantizeOp per activation and rewires consumers
@@ -361,20 +365,62 @@ def _disable_softmax_quantizers(quant_sim: QuantSimOnnx) -> list[str]:
         for node in graph.node
         if node.op_type == "QcQuantizeOp"
     }
-
-    disabled = []
+    qdq_alias = {source: output for output, source in qdq_source.items()}
+    consumers: dict[str, list] = {}
     for node in graph.node:
-        if node.op_type != "Softmax":
+        for tensor in node.input:
+            consumers.setdefault(tensor, []).append(node)
+
+    softmax: list[str] = []
+    rotation: list[str] = []
+    for node in graph.node:
+        if node.op_type == "Softmax":
+            # The input has been rewired onto a QcQuantizeOp output, so map it
+            # back. The output keeps its own name -- its QcQuantizeOp consumes it.
+            _disable(quant_sim, qdq_source.get(node.input[0], node.input[0]), softmax)
+            probs = node.output[0]
+            _disable(quant_sim, probs, softmax)
+            # Consumers read the QcQuantizeOp alias, so look the Cast up under it.
+            for consumer in consumers.get(qdq_alias.get(probs, probs), []):
+                if consumer.op_type == "Cast":
+                    _disable(quant_sim, consumer.output[0], softmax)
+        elif node.op_type == "MatMul" and len(node.input) == 2:
+            weight = qdq_source.get(node.input[1], node.input[1])
+            if weight.endswith("_hadamard"):
+                tensor = qdq_source.get(node.input[0], node.input[0])
+                _disable(quant_sim, tensor, rotation)
+    return softmax, rotation
+
+
+def _enable_rotated_quantizers(quant_sim: QuantSimOnnx) -> list[str]:
+    """Quantize the *output* of every online Hadamard rotation that rotates.
+
+    QuantSimOnnx creates a QcQuantizeOp for every quantizable activation and the
+    configurator then disables them all, so the quantizer already exists here and
+    only needs re-enabling. It was created with op_mode updateStats, which
+    ``enabled`` does not touch, so calibration picks it up.
+
+    - The expert-R1 un-rotate nodes are skipped: name_prefix=f"r1_unrot{idx}",
+
+    Returns the tensor names that were enabled.
+    """
+    enabled: list[str] = []
+    # connected_graph resolves tensor names for us, so unlike _disable_quantizers
+    # this needs no QcQuantizeOp alias remap. Same idiom as
+    # _set_matmul_second_input_to_8b, which walks the graph the same way.
+    for op in quant_sim.connected_graph.ordered_ops:
+        if op.type != "MatMul" or len(op.inputs) < 2:
             continue
-        # The input has been rewired onto a QcQuantizeOp output, so map it back.
-        # The output tensor keeps its own name -- its QcQuantizeOp consumes it.
-        scores = qdq_source.get(node.input[0], node.input[0])
-        for tensor in (scores, node.output[0]):
-            quantizer = quant_sim.qc_quantize_op_dict.get(tensor)
-            if quantizer is not None and quantizer.enabled:
-                quantizer.enabled = False
-                disabled.append(tensor)
-    return disabled
+        rotation = op.inputs[1].name
+        if not rotation.endswith("_hadamard"):
+            continue
+        if rotation.startswith("r1_unrot"):
+            continue
+        for quantizer in quant_sim.get_op_quantizers(op)[1]:
+            if not quantizer.enabled:
+                quantizer.enabled = True
+                enabled.append(op.outputs[0].name)
+    return enabled
 
 
 MAX_TOKEN_LENGTH = 200  # 48 for pi0, 200 for pi05
@@ -1910,8 +1956,13 @@ class Pi05PaliGemmaBackboneQuantizable(
         )
         _set_matmul_second_input_to_8b(quant_sim)
         # Must follow bitwidth override above
-        exempted = _disable_softmax_quantizers(quant_sim)
-        print(f"Left {len(exempted)} softmax tensor(s) in float (logits + probs)")
+        softmax, rotation = _disable_quantizers(quant_sim)
+        print(
+            f"Left {len(softmax)} softmax tensor(s) (logits + probs) and "
+            f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) in float"
+        )
+        rotated = _enable_rotated_quantizers(quant_sim)
+        print(f"Quantized {len(rotated)} rotated tensor(s) (R1/R3/R4 outputs)")
         # After the bitwidth overrides above -- see _load_bundle_encodings.
         _load_bundle_encodings(quant_sim, self._onnx_bundle)
         return quant_sim
@@ -1996,6 +2047,7 @@ class Pi05ActionExpertQuantizable(
         host_device: torch.device = torch.device("cpu"),
         onnx_bundle: ONNXBundle | None = None,
         precision: Precision = Precision.w8a16,
+        use_spinquant_r1: bool = False,
         use_spinquant_r2: bool = False,
         use_spinquant_r3: bool = False,
         use_spinquant_r4: bool = False,
@@ -2004,6 +2056,7 @@ class Pi05ActionExpertQuantizable(
         BaseModel.__init__(self, None)
         self.host_device = host_device
         self._precision = precision
+        self._use_spinquant_r1 = use_spinquant_r1
         self._use_spinquant_r2 = use_spinquant_r2
         self._use_spinquant_r3 = use_spinquant_r3
         self._use_spinquant_r4 = use_spinquant_r4
@@ -2018,6 +2071,10 @@ class Pi05ActionExpertQuantizable(
             # Compensates the R2 baked into the backbone's exported V caches.
             # Not independent from backbone (and vice versa).
             apply_action_expert_r2(onnx_model)
+        if self._use_spinquant_r1:
+            # Counterpart to the weight-only fold apply_action_expert_r1 did
+            # before export. Independent from backbone (and vice versa).
+            apply_action_expert_r1_online(onnx_model)
         if self._use_spinquant_r4:
             # Independent from backbone (and vice versa)
             apply_action_expert_r4(onnx_model)
@@ -2041,8 +2098,13 @@ class Pi05ActionExpertQuantizable(
         _set_tensors_to_output_8b_sym(quant_sim, kv_inputs)
         _set_matmul_second_input_to_8b(quant_sim)
         # Must follow bitwidth override above
-        exempted = _disable_softmax_quantizers(quant_sim)
-        print(f"Left {len(exempted)} softmax tensor(s) in float (logits + probs)")
+        softmax, rotation = _disable_quantizers(quant_sim)
+        print(
+            f"Left {len(softmax)} softmax tensor(s) (logits + probs) and "
+            f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) in float"
+        )
+        rotated = _enable_rotated_quantizers(quant_sim)
+        print(f"Quantized {len(rotated)} rotated tensor(s) (R1/R3/R4 outputs)")
         # After the bitwidth overrides above -- see _load_bundle_encodings.
         _load_bundle_encodings(quant_sim, self._onnx_bundle)
         return quant_sim
@@ -2059,7 +2121,7 @@ class Pi05ActionExpertQuantizable(
         policy = load_checkpoint(str(checkpoint))
         expert = Pi05ActionExpert(policy).to(host_device).eval()
         if use_spinquant_r1:
-            apply_action_expert_r1(expert, NUM_ACTION_STEPS)
+            apply_action_expert_r1(expert)
         return expert
 
     @classmethod
@@ -2075,12 +2137,9 @@ class Pi05ActionExpertQuantizable(
         Same as the base FromPretrainedMixin.onnx_from_pretrained, except it
         threads use_spinquant_r1 through to torch_from_pretrained. The base
         implementation doesn't forward extra kwargs to torch_from_pretrained,
-        but the R1 fold must happen on the PyTorch module *before* export
-        (unlike R2, which rotates the already-exported ONNX model in
-        make_quant_sim): AdaRMS's per-channel scale/shift/gate is a genuine
-        runtime computation, so the localized online-rotation wrapper
-        apply_action_expert_r1 installs must be part of the traced graph, not
-        inserted into it afterward. See spinquant_r1.py.
+        but the R1 weight fold (apply_action_expert_r1) must happen on the
+        PyTorch module *before* export, unlike R2, which rotates the
+        already-exported ONNX model in make_quant_sim. See spinquant_r1.py.
         """
         subfolder_hf = subfolder or cls.default_subfolder_hf
         subfolder_local = subfolder or cls.default_subfolder
@@ -2161,6 +2220,7 @@ class Pi05ActionExpertQuantizable(
             host_device=host_device,
             onnx_bundle=bundle,
             precision=precision,
+            use_spinquant_r1=use_spinquant_r1,
             use_spinquant_r2=use_spinquant_r2,
             use_spinquant_r3=use_spinquant_r3,
             use_spinquant_r4=use_spinquant_r4,

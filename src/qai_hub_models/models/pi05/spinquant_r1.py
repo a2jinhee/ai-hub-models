@@ -60,12 +60,12 @@ from __future__ import annotations
 
 import json
 import re
-import types
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import numpy as np
 import onnx
 import torch
 from aimet_onnx.experimental.spinquant.model_analysis import (
@@ -912,165 +912,164 @@ def apply_action_expert_r3(onnx_model: onnx.ModelProto) -> tuple[int, int]:
     return n_q, n_k
 
 
-class _R1WrappedAdaRMSNorm(torch.nn.Module):
+def _find_adarmsnorm_anchors(
+    onnx_model: onnx.ModelProto,
+    consumers_by_tensor: dict[str, list[onnx.NodeProto]],
+) -> list[tuple[onnx.NodeProto, str]]:
     """
-    Wrap an action-expert AdaRMSNorm so it operates correctly when its input
-    lives in the R1-rotated residual-stream basis.
+    Return one (scale_mul, norm_output_tensor) pair per AdaRMSNorm subgraph.
 
-    AdaRMSNorm's pure-normalization step (division by RMS) is rotation-
-    equivariant -- rotation preserves L2 norm, so rmsnorm(x @ R1) == rmsnorm(x)
-    @ R1 exactly -- but its per-channel scale/shift modulation (derived from
-    adarms_cond via a static nn.Linear; see
-    transformers.models.gemma.modeling_gemma.GemmaRMSNorm.forward) is not: it
-    was learned for the *unrotated* channel basis, and an elementwise multiply
-    doesn't commute with a dense rotation matrix. So the input is un-rotated
-    before calling the original norm, and its output is re-rotated after.
-    `gate` is deliberately left un-rotated -- see apply_action_expert_r1's
-    docstring for why it's consumed in the unrotated basis, not this one.
-
-    Verified algebraically (not yet against the real checkpoint) in
-    verify_r1_fold.py; see apply_action_expert_r1's docstring.
+    - Located by RMSNorm's shape rather than by node name
+    - ValueError if the x * recip_rms output does not have exactly one consumer.
     """
+    anchors: list[tuple[onnx.NodeProto, str]] = []
+    for node in onnx_model.graph.node:
+        if node.op_type != "Sqrt":
+            continue
+        divs = [c for c in consumers_by_tensor.get(node.output[0], []) if c.op_type == "Div"]
+        if len(divs) != 1:
+            continue
+        muls = [c for c in consumers_by_tensor.get(divs[0].output[0], []) if c.op_type == "Mul"]
+        if len(muls) != 1:
+            continue
+        xn = muls[0]
+        xn_consumers = consumers_by_tensor.get(xn.output[0], [])
+        if len(xn_consumers) != 1:
+            raise ValueError(
+                f"Expert R1: normalized activation '{xn.output[0]}' has "
+                f"{len(xn_consumers)} consumers, expected exactly one (the "
+                "per-channel scale multiply)."
+            )
+        scale_mul = xn_consumers[0]
+        tensor = scale_mul.output[0]
+        while True:
+            nxt = consumers_by_tensor.get(tensor, [])
+            if len(nxt) == 1 and nxt[0].op_type in ("Mul", "Add", "Cast"):
+                tensor = nxt[0].output[0]
+            else:
+                break
+        anchors.append((scale_mul, tensor))
+    return anchors
 
-    def __init__(self, norm: torch.nn.Module, r1: torch.Tensor) -> None:
-        super().__init__()
-        self.norm = norm
-        self.register_buffer("r1", r1, persistent=False)
 
-    def forward(
-        self, x: torch.Tensor, cond: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        x_unrot = x @ self.r1.T
-        normed, gate = self.norm(x_unrot, cond)
-        return normed @ self.r1, gate
-
-
-def _r1_expert_forward(
-    self,
-    full_att_4d: torch.Tensor,
-    rope_emb_sin: torch.Tensor,
-    rope_emb_cos: torch.Tensor,
-    k_caches: list[torch.Tensor],
-    v_caches: list[torch.Tensor],
-    x_t: torch.Tensor,
-    adarms_cond: torch.Tensor,
-) -> torch.Tensor:
+def apply_action_expert_r1_online(onnx_model: onnx.ModelProto) -> tuple[int, int, int]:
     """
-    Replacement for Pi05ActionExpert.expert_forward, 
-    bound to R1-rotated expert instance by apply_action_expert_r1.
+    Insert un-foldable expert-R1 rotations, in place.
 
-    Identical to the original except the two gated-residual-add lines rotate
-    the (unrotated-basis) gated sublayer output into the rotated
-    residual-stream basis before adding it to hidden_suffix -- see
-    apply_action_expert_r1's docstring for why o_proj/mlp.down_proj are left
-    unrotated and gate can't be folded into a static weight.
+    Three sites, all inserted with insert_online_hadamard_node::
+        1. bring the activation down to the scale/shift's basis (un-rotate)
+        2. put the activation back into the rotated basis (re-rotate)
+        3. Rotate gated residual (o_proj, mlp.down_proj)
+            - counterpart is action_in_proj's folded weights
+        - R1 is a symmetric Hadamard `R == R.T`
+
+    Parameters:: onnx_model, mutated in place.
+    Returns:: counts = tuple[int, int, int]
+        - Number of (un-rotate, re-rotate, gated-residual) rotations inserted.
     """
-    flow = self.model
-    pg_we = flow.paligemma_with_expert
-    gemma_layers = pg_we.gemma_expert.model.layers
-    r1 = self._spinquant_r1
-
-    device = next(flow.parameters()).device
-    x_t = x_t.to(device)
-    rope_emb_sin = rope_emb_sin.to(device)
-    rope_emb_cos = rope_emb_cos.to(device)
-    adarms_cond = adarms_cond.to(device)
-    full_att_4d = full_att_4d.to(device)
-
-    suffix_embs = flow.action_in_proj(x_t)
-    hidden_suffix = suffix_embs.to(torch.float32)
-
-    for layer_idx, layer in enumerate(gemma_layers):
-        normed, gate = layer.input_layernorm(hidden_suffix, adarms_cond)
-
-        out_emb = layer.self_attn(
-            normed,
-            rope_emb_sin,
-            rope_emb_cos,
-            k_caches[layer_idx].to(device),
-            v_caches[layer_idx].to(device),
-            full_att_4d,
+    # Return the residual-stream width for the action expert.
+    dims = {
+        int(init.dims[1])
+        for init in onnx_model.graph.initializer
+        if len(init.dims) == 2 and init.dims[0] == 3 * init.dims[1]
+    }
+    if len(dims) != 1:
+        raise ValueError(
+            "Expected exactly one [3*hidden, hidden] initializer "
+            f"shape, found {sorted(dims)}."
+        )
+    
+    hidden_size = dims.pop()
+    R1 = hadamard_rotation_matrix(hidden_size)
+    if not np.allclose(R1, R1.T):
+        raise ValueError(
+            f"Expert R1: Hadamard of size {hidden_size} is not symmetric, so the "
+            "un-rotate direction cannot reuse insert_online_hadamard_node."
         )
 
-        if gate is None:
-            out_emb = out_emb @ r1 + hidden_suffix
-        else:
-            out_emb = (out_emb * gate) @ r1 + hidden_suffix
+    consumers = _index_consumers_by_tensor(onnx_model)
+    anchors = _find_adarmsnorm_anchors(onnx_model, consumers)
 
-        after_first_residual = out_emb
+    # Final norm input is the residual stream, which is in rotated basis
+    # Final norm output feeds action_out_proj
+    # Don't skip un-rotate, but skip re-rotate and residual add.
+    n_unrot = n_rot = n_res = 0
+    for idx, (scale_mul, norm_out) in enumerate(anchors):
+        insert_online_hadamard_node(
+            onnx_model,
+            target_tensor_name=scale_mul.input[0],
+            consumer_nodes=[scale_mul],
+            head_dim=hidden_size,
+            name_prefix=f"r1_unrot{idx}",
+        )
+        n_unrot += 1
+        
+        out_consumers = consumers.get(norm_out, [])
+        if not any(c.op_type == "MatMul" for c in out_consumers):
+            continue
+        insert_online_hadamard_node(
+            onnx_model,
+            target_tensor_name=norm_out,
+            consumer_nodes=list(out_consumers),
+            head_dim=hidden_size,
+            name_prefix=f"r1_rot{idx}",
+        )
+        n_rot += 1
 
-        out_emb, gate2 = layer.post_attention_layernorm(out_emb, adarms_cond)
-        out_emb = layer.mlp(out_emb)
+        # The residual add reads the norm's own input passthrough, so it is the
+        # one consumer of that tensor lying outside the norm's name scope.
+        scope = scale_mul.name.rsplit("/", 1)[0]
+        passthrough = f"{scope}/Cast_output_0"
+        outside = [
+            c for c in consumers.get(passthrough, []) if not c.name.startswith(scope + "/")
+        ]
+        if len(outside) != 1 or outside[0].op_type != "Add":
+            raise ValueError(
+                f"Expert R1: norm '{scope}' passthrough '{passthrough}' has "
+                f"{[c.name for c in outside]} outside the norm scope, expected "
+                "exactly one residual Add."
+            )
+        add = outside[0]
+        gated = [t for t in add.input if t != passthrough]
+        if len(gated) != 1:
+            raise ValueError(
+                f"Expert R1: residual add '{add.name}' inputs {list(add.input)} "
+                "do not resolve to one gated sublayer output."
+            )
+        insert_online_hadamard_node(
+            onnx_model,
+            target_tensor_name=gated[0],
+            consumer_nodes=[add],
+            head_dim=hidden_size,
+            name_prefix=f"r1_rot{idx}res",
+        )
+        n_res += 1
 
-        if gate2 is None:
-            hidden_suffix = out_emb @ r1 + after_first_residual
-        else:
-            hidden_suffix = (out_emb * gate2) @ r1 + after_first_residual
-
-    # Final norm: un-rotate on entry like the other AdaRMS calls, but do NOT
-    # re-rotate the output -- action_out_proj is deliberately left unmodified
-    # (see apply_action_expert_r1's docstring), so it must be fed the norm's
-    # natural, unrotated output, not a rotated one. Unlike input_layernorm /
-    # post_attention_layernorm, this call is not wrapped with
-    # _R1WrappedAdaRMSNorm for exactly this reason.
-    hidden_unrot = hidden_suffix @ r1.T
-    hidden_suffix, _ = pg_we.gemma_expert.model.norm(hidden_unrot, adarms_cond)
-    suffix_only = hidden_suffix[:, -self._num_action_steps :]
-    suffix_only = suffix_only.to(torch.float32)
-    return flow.action_out_proj(suffix_only)
+    if not (n_unrot == n_rot + 1 and n_rot == n_res and n_res > 0):
+        raise ValueError(
+            f"Expert R1: inserted {n_unrot} un-rotate, {n_rot} re-rotate and "
+            f"{n_res} residual rotations"
+        )
+    return n_unrot, n_rot, n_res
 
 
-def apply_action_expert_r1(expert: torch.nn.Module, num_action_steps: int) -> None:
+def apply_action_expert_r1(expert: torch.nn.Module) -> None:
     """
-    Fold R1 into the action expert's own residual stream.
+    Fold R1 into the action expert's weights, in place.
 
-    - Unlike apply_action_expert_r2 (which overwrites ONNX initializers), 
-    this operates on the PyTorch module *before* export
-    
-    - The action expert has AdaRMSNorm layers--
-      their scale/shift/gate values are computed on the fly from adarms_cond, 
-      a value that's different every time the graph runs 
-      (a single exported graph gets called once per step, each with a different time_step). 
-      You can't pre-bake a rotation into something that's recomputed at runtime, 
-      so a static fold (ex. backbone R1/R2) isn't possible for whatever touches those norms.
-    
-    - Most layers (q_proj_sha, k_proj_sha, v_proj_sha, mlp.gate_proj, mlp.up_proj, action_in_proj) 
-    bake R1 into weight matrix ahead of time.
-    -  The 3 AdaRMSNorm calls per layer, 
-    and the 2 places where a gated result gets added back into the residual stream 
-    # ! There are real, on-device rotation matmuls still happening at specific points
-    - Unlike R2, which requires (backbone - action expert) to be rotated as a matched pair 
-    this R1 rotation is self-contained within the action expert. 
-    - NOTE NOT YET verified against the real checkpoint
+    - Operates on the PyTorch module before export, unlike apply_action_expert_r2 
+      which overwrites ONNX initializers. 
+    - Self-contained: there is no backbone counterpart to pair with unlike R2/R3.
+    - The AdaRMSNorm + two gated residual adds per layer cannot be folded 
+        -- scale/shift/gate are computed at runtime from adarms_cond
 
-    - Convention:
-      - "Reading" layers (q_proj_sha, k_proj_sha, v_proj_sha, mlp.gate_proj, mlp.up_proj)
-        consume the rotated residual stream; `W_new = W_old @ R1`.
-      - "Writing" layer (action_in_proj) 
-        produces something that gets added into the rotated stream
-        it needs to apply the rotation on the external input so it lands correctly 
-        in the rotated stream's coordinate system: `W_new = R1.T @ W_old`.
-      - UNMODIFIED (o_proj & mlp.down_proj): 
-        their output are gated before being added to the residual stream,
-        and gate can neither be folded into a static weight (runtime adams_cond)
-        Instead, _r1_expert_forward gates original unrotated numbers,
-        and then rotates the *gated* result beforethe residual add.
-      - UNMODIFIED (action_out_proj): Unrotated as it is the last layer. 
-
-    Parameters
-    ----------
-    expert
-        A Pi05ActionExpert instance, already built from a checkpoint. 
-        Mutates in place: 
-            - reading-layer weights are rotated, 
-            - the three AdaRMSNorm modules are wrapped, 
-            - and expert_forward is replaced with an R1-aware version bound to this instance only 
-            (other instances / the class itself are untouched).
-    num_action_steps
-        Number of trailing suffix positions expert_forward slices out after
-        the final norm (NUM_ACTION_STEPS in qai_hub_models.models.pi05.model).
-        Passed in rather than imported to avoid a circular import: that
-        module imports this one.
+    Convention:
+      - "Reading" layers (q_proj_sha, k_proj_sha, v_proj_sha, mlp.gate_proj,
+        mlp.up_proj) consume the rotated residual stream: `W_new = W_old @ R1`.
+      - "Writing" layer (action_in_proj) writes into the rotated stream:
+        `W_new = R1.T @ W_old`.
+        
+    Parameters:: expert; A Pi05ActionExpert instance, mutated in place.
     """
     flow = expert.model
     pg_we = flow.paligemma_with_expert
@@ -1094,24 +1093,10 @@ def apply_action_expert_r1(expert: torch.nn.Module, num_action_steps: int) -> No
                 k.weight.copy_(k.weight @ r1)
             for v in self_attn.v_proj_sha:
                 v.weight.copy_(v.weight @ r1)
-            # o_proj intentionally left unmodified -- see docstring.
+            # skip o_proj: gated residual
 
             mlp = layer.mlp
             mlp.gate_proj.weight.copy_(mlp.gate_proj.weight @ r1)
             mlp.up_proj.weight.copy_(mlp.up_proj.weight @ r1)
-            # down_proj intentionally left unmodified -- see docstring.
-
-            layer.input_layernorm = _R1WrappedAdaRMSNorm(layer.input_layernorm, r1)
-            layer.post_attention_layernorm = _R1WrappedAdaRMSNorm(
-                layer.post_attention_layernorm, r1
-            )
-
-        # Final norm is intentionally left UNwrapped: _r1_expert_forward calls
-        # it directly with an explicit un-rotate (matching entry behavior of
-        # the wrapped norms above) but no re-rotation of its output -- see
-        # action_out_proj note below and _r1_expert_forward.
-        # action_out_proj intentionally left unmodified -- see docstring.
-
-    expert._spinquant_r1 = r1
-    expert._num_action_steps = num_action_steps
-    expert.expert_forward = types.MethodType(_r1_expert_forward, expert)
+            # skip down_proj: gated residual
+            # skip action_out_proj: last layer.
