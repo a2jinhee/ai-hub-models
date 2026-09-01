@@ -4,7 +4,6 @@
     "hw_version": "V69",
     "ops":
     {
-      "is_output_quantized": "True",
       "is_symmetric": "True"
     },
     "params":
@@ -27,10 +26,6 @@
 
   "op_type":
   {
-    "Cast":
-    {
-      "is_output_quantized": "False"
-    },
     "BatchPermutation":
     {
       "is_output_quantized": "False"
@@ -84,8 +79,13 @@
     {
       "is_output_quantized": "False"
     },
+    "Conv":
+    {
+      "is_input_quantized": "True"
+    },
     "Gemm":
     {
+      "is_input_quantized": "True",
       "per_channel_quantization": "True"
     },
     "GroupNorm":
@@ -125,6 +125,7 @@
     },
     "MatMul":
     {
+      "is_input_quantized": "True",
       "per_channel_quantization": "True"
     },
     "MaxPool":

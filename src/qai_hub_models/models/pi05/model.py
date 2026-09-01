@@ -349,11 +349,13 @@ def _disable(quant_sim: QuantSimOnnx, tensor: str, disabled: list[str]) -> None:
 
 def _disable_quantizers(
     quant_sim: QuantSimOnnx,
-) -> tuple[list[str], list[str]]:
+    float_inputs: tuple[str, ...] = (),
+) -> tuple[list[str], list[str], list[str]]:
     """Disable quantizers for certain tensors
 
     - Softmax:: its input, its output, and Cast between output and P*V MatMul.
     - Online Hadamard rotations (expert R1, R3, R4):: the node's activation input.
+    - Model inputs in ``float_inputs``.
     - Returns the disabled tensor names.
     """
     graph = quant_sim.model.graph()
@@ -389,7 +391,11 @@ def _disable_quantizers(
             if weight.endswith("_hadamard"):
                 tensor = qdq_source.get(node.input[0], node.input[0])
                 _disable(quant_sim, tensor, rotation)
-    return softmax, rotation
+
+    model_inputs: list[str] = []
+    for tensor in float_inputs:
+        _disable(quant_sim, tensor, model_inputs)
+    return softmax, rotation, model_inputs
 
 
 def _enable_rotated_quantizers(quant_sim: QuantSimOnnx) -> list[str]:
@@ -1956,10 +1962,20 @@ class Pi05PaliGemmaBackboneQuantizable(
         )
         _set_matmul_second_input_to_8b(quant_sim)
         # Must follow bitwidth override above
-        softmax, rotation = _disable_quantizers(quant_sim)
+        # Graph inputs: none of them feeds a Conv/Gemm/MatMul.
+        softmax, rotation, model_inputs = _disable_quantizers(
+            quant_sim,
+            float_inputs=(
+                "hidden_state",
+                "prefix_att_2d_masks",
+                "rope_emb_sin",
+                "rope_emb_cos",
+            ),
+        )
         print(
-            f"Left {len(softmax)} softmax tensor(s) (logits + probs) and "
-            f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) in float"
+            f"Left {len(softmax)} softmax tensor(s) (logits + probs), "
+            f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) and "
+            f"{len(model_inputs)} model input(s) in float"
         )
         rotated = _enable_rotated_quantizers(quant_sim)
         print(f"Quantized {len(rotated)} rotated tensor(s) (R1/R3/R4 outputs)")
@@ -2098,10 +2114,15 @@ class Pi05ActionExpertQuantizable(
         _set_tensors_to_output_8b_sym(quant_sim, kv_inputs)
         _set_matmul_second_input_to_8b(quant_sim)
         # Must follow bitwidth override above
-        softmax, rotation = _disable_quantizers(quant_sim)
+        # RoPE coefficients: feed no Conv/Gemm/MatMul.
+        softmax, rotation, model_inputs = _disable_quantizers(
+            quant_sim,
+            float_inputs=("rope_emb_sin", "rope_emb_cos"),
+        )
         print(
-            f"Left {len(softmax)} softmax tensor(s) (logits + probs) and "
-            f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) in float"
+            f"Left {len(softmax)} softmax tensor(s) (logits + probs), "
+            f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) and "
+            f"{len(model_inputs)} model input(s) in float"
         )
         rotated = _enable_rotated_quantizers(quant_sim)
         print(f"Quantized {len(rotated)} rotated tensor(s) (R1/R3/R4 outputs)")
