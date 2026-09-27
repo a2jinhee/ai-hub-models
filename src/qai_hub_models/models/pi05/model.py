@@ -353,7 +353,8 @@ def _disable_quantizers(
 ) -> tuple[list[str], list[str], list[str]]:
     """Disable quantizers for certain tensors
 
-    - Softmax:: its input, its output, and Cast between output and P*V MatMul.
+    - Softmax:: its input only. Its output feeds the P*V MatMul, whose other
+      operand (V) is quantized, and HTP has no float x quantized MatMul kernel.
     - Online Hadamard rotations (expert R1, R3, R4):: the node's activation input.
     - Model inputs in ``float_inputs``.
     - Returns the disabled tensor names.
@@ -367,25 +368,13 @@ def _disable_quantizers(
         for node in graph.node
         if node.op_type == "QcQuantizeOp"
     }
-    qdq_alias = {source: output for output, source in qdq_source.items()}
-    consumers: dict[str, list] = {}
-    for node in graph.node:
-        for tensor in node.input:
-            consumers.setdefault(tensor, []).append(node)
 
     softmax: list[str] = []
     rotation: list[str] = []
     for node in graph.node:
         if node.op_type == "Softmax":
-            # The input has been rewired onto a QcQuantizeOp output, so map it
-            # back. The output keeps its own name -- its QcQuantizeOp consumes it.
+            # The input has been rewired onto a QcQuantizeOp output, so map it back.
             _disable(quant_sim, qdq_source.get(node.input[0], node.input[0]), softmax)
-            probs = node.output[0]
-            _disable(quant_sim, probs, softmax)
-            # Consumers read the QcQuantizeOp alias, so look the Cast up under it.
-            for consumer in consumers.get(qdq_alias.get(probs, probs), []):
-                if consumer.op_type == "Cast":
-                    _disable(quant_sim, consumer.output[0], softmax)
         elif node.op_type == "MatMul" and len(node.input) == 2:
             weight = qdq_source.get(node.input[1], node.input[1])
             if weight.endswith("_hadamard"):
@@ -1973,7 +1962,7 @@ class Pi05PaliGemmaBackboneQuantizable(
             ),
         )
         print(
-            f"Left {len(softmax)} softmax tensor(s) (logits + probs), "
+            f"Left {len(softmax)} softmax tensor(s) (logits), "
             f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) and "
             f"{len(model_inputs)} model input(s) in float"
         )
@@ -2114,13 +2103,11 @@ class Pi05ActionExpertQuantizable(
         _set_tensors_to_output_8b_sym(quant_sim, kv_inputs)
         _set_matmul_second_input_to_8b(quant_sim)
         # Must follow bitwidth override above
-        # RoPE coefficients: feed no Conv/Gemm/MatMul.
-        softmax, rotation, model_inputs = _disable_quantizers(
-            quant_sim,
-            float_inputs=("rope_emb_sin", "rope_emb_cos"),
-        )
+        # RoPE coefficients rotate Q, which does feed the Q@K^T MatMul, whose
+        # other operand (cached K) is 8-bit. A float Q there is not HTP-legal.
+        softmax, rotation, model_inputs = _disable_quantizers(quant_sim)
         print(
-            f"Left {len(softmax)} softmax tensor(s) (logits + probs), "
+            f"Left {len(softmax)} softmax tensor(s) (logits), "
             f"{len(rotation)} pre-rotation tensor(s) (R1/R3/R4 inputs) and "
             f"{len(model_inputs)} model input(s) in float"
         )

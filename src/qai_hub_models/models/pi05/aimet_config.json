@@ -4,6 +4,7 @@
     "hw_version": "V69",
     "ops":
     {
+      "is_output_quantized": "True",
       "is_symmetric": "True"
     },
     "params":
@@ -127,6 +128,10 @@
     {
       "is_input_quantized": "True",
       "per_channel_quantization": "True"
+    },
+    "RMSNormalization":
+    {
+      "per_channel_quantization": "False"
     },
     "MaxPool":
     {
